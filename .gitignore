@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 构建产物（体积大，不进仓库）----
+dist/
+dist_onedir/
+build/
+.tmp/
+_tmp/
+.tools/
+*.spec.bak
+
+# ---- 交付目录（打好的 exe / zip / 安装包）----
+成品软件/
+输出/
+
+# ---- 运行时目录 ----
+.pytest_cache/
+_MEI*/
+*.log
+
+# ---- 大体积第三方资源（用 scripts/download_weights.ps1 拉取）----
+# 抠图模型 24.7MB：不放进 git，避免仓库膨胀（GitHub 单文件上限 100MB，且 clone 会变慢）
+app/vendor/hivision/creator/weights/*.onnx
+app/vendor/hivision/plugin/font/*.ttf
+
+# ---- 设计过程稿（截图已挑进 screenshots/）----
+UI布局方案/
+UI方案对比/
+实机界面/
+
+# ---- 内部交接笔记（不上公开仓库）----
+交接笔记-*.md
+任务书-第一段.md
+计划书.md
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

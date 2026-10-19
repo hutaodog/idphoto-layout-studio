@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "note": "背景色表。hex 为权威值；rgb 供 OpenCV(BGR) 与 PIL(RGB) 使用。深蓝色两个开源实现取值不一致（LiYing #0047AB vs Hivision #4B6190），本项目采用 #4B6190。",
+  "colors": [
+    { "id": "white",     "name_zh": "白色",   "hex": "FFFFFF", "rgb": [255, 255, 255], "note": "身份证/护照/各类考试报名通用（官方只认白或浅色）" },
+    { "id": "blue",      "name_zh": "标准蓝", "hex": "628BCE", "rgb": [98, 139, 206],  "note": "通用蓝底，两个开源实现一致" },
+    { "id": "red",       "name_zh": "红色",   "hex": "D74532", "rgb": [215, 69, 50],   "note": "结婚证、部分场景，两个开源实现一致" },
+    { "id": "darkblue",  "name_zh": "深蓝色", "hex": "4B6190", "rgb": [75, 97, 144],   "note": "正式场合；两库不一致，本项目取 Hivision 值" },
+    { "id": "lightgray", "name_zh": "浅灰色", "hex": "F2F0F0", "rgb": [242, 240, 240], "note": "备选底色" },
+    { "id": "schengen",  "name_zh": "申根浅灰", "hex": "D3D3D3", "rgb": [211, 211, 211], "note": "申根签证要求的浅灰底" },
+    { "id": "black",     "name_zh": "黑色",   "hex": "000000", "rgb": [0, 0, 0],       "note": "备选底色" }
+  ]
+}

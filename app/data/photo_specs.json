@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "updated": "2026-10-15",
+  "rules": [
+    "mm 为宽×高（打印口径），px 为宽×高（像素口径），dpi 是每条规格的独立字段——禁止当成全局常量 300。",
+    "上传像素与打印毫米是两套口径（例如 NCRE 要求最小 192×144px 且成像区 48×33mm），两组值都保留，永不互相换算。",
+    "px 一律等于 round(mm/25.4*dpi)；报名系统强制指定像素时，把 mm 反算成与该像素自洽的值。",
+    "**同一个物理尺寸只保留一条规格**（用户反馈：「把什么一寸、二寸、三寸的，就留一个正常用的那个」）：不同 dpi 的变体合并（dpi 在「输出设置」里选），同名不同用途的证件（驾照/社保卡/护照…）合并成别名，靠 aliases 仍然搜得到。",
+    "同名不同义的历史口径（二寸曾有 35×53 与 37×49 两种）只留主流一条，另一条要么删、要么明确标注；因此用 (用途, 来源) 区分，并为每条保留 source 与 confidence。"
+  ],
+  "confidence_levels": {
+    "A": "官方页面原文核实",
+    "B": "两个以上成熟开源实现一致，且与 mm→px@dpi 数学自洽",
+    "C": "单一实现或行业惯例",
+    "D": "未核实，需实测"
+  },
+  "compose_default": { "head_measure_ratio": 0.2, "head_height_ratio": 0.45, "head_top_range": [0.12, 0.1] },
+  "specs": [
+    { "id": "cn_xiaoyicun", "name_zh": "小一寸", "aliases": ["小1寸", "驾驶证", "驾照", "电子驾驶证", "电子驾照"], "category": "中国常用", "mm": [22, 32], "dpi": 300, "px": [260, 378], "bg": ["white", "blue"], "note": "驾驶证、电子驾驶证同尺寸；交管上传通常要求 14~30KB", "source": "LiYing size_zh.csv（驾驶证同值）", "confidence": "B" },
+    { "id": "cn_yicun", "name_zh": "一寸", "aliases": ["1寸", "one inch", "简历照", "求职照"], "category": "中国常用", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white", "blue", "red"], "note": "简历照/求职照同尺寸", "source": "LiYing 与 Hivision 一致", "confidence": "B" },
+    { "id": "cn_dayicun", "name_zh": "大一寸", "aliases": ["大1寸", "小二寸", "小2寸", "中国护照", "护照", "港澳通行证", "台湾通行证"], "category": "中国常用", "mm": [33, 48], "dpi": 300, "px": [390, 567], "bg": ["white", "blue"], "note": "护照、港澳/台湾通行证、小二寸都是这个尺寸", "source": "LiYing 与 Hivision 一致（护照/通行证同值）", "confidence": "B" },
+    { "id": "cn_ercun", "name_zh": "二寸", "aliases": ["2寸", "大二寸", "大2寸"], "category": "中国常用", "mm": [35, 53], "dpi": 300, "px": [413, 626], "bg": ["white", "blue"], "note": "另有 35×49 口径（部分照相馆叫二寸，本库单列为「简历照（宽版）」）", "source": "LiYing 主行，Hivision 同值", "confidence": "B" },
+    { "id": "cn_sancun", "name_zh": "三寸", "aliases": ["3寸"], "category": "中国常用", "mm": [55, 84], "dpi": 300, "px": [650, 992], "bg": ["white", "blue"], "source": "行业惯例；资料中的 649×991 与 55×84mm 不自洽，此处按 mm 换算取 650×992", "confidence": "D" },
+    { "id": "cn_5inch_life", "name_zh": "五寸生活照", "aliases": ["5寸生活照"], "category": "中国常用", "mm": [89, 127], "dpi": 300, "px": [1051, 1500], "bg": ["white", "blue", "red", "darkblue", "lightgray", "black"], "source": "LiYing（3R 标准）", "confidence": "B" },
+    { "id": "cn_idcard", "name_zh": "身份证", "aliases": ["居民身份证", "社保卡", "社会保障卡", "居住证"], "category": "中国常用", "mm": [26, 32], "dpi": 350, "px": [358, 441], "bg": ["white"], "note": "社保卡、居住证同尺寸；社保卡上传通常要求 9~20KB", "source": "LiYing 显式标注 350dpi；Hivision 同像素但错标 300dpi", "confidence": "B" },
+    { "id": "cn_marriage", "name_zh": "结婚证照", "aliases": ["结婚照"], "category": "中国常用", "mm": [53, 35], "dpi": 300, "px": [626, 413], "bg": ["red"], "source": "LiYing 色表 + 行业惯例；民政部规范未抓到", "confidence": "D" },
+    { "id": "cn_resume_wide", "name_zh": "简历照（宽版）", "aliases": ["求职照宽版", "35x49", "35×49", "二寸宽版"], "category": "中国常用", "mm": [35, 49], "dpi": 300, "px": [413, 579], "bg": ["white", "blue"], "note": "35×49mm 口径——部分照相馆把它叫「二寸」（本库二寸取 35×53）", "source": "行业惯例；另有 25×35 口径", "confidence": "C" },
+    { "id": "cn_degree", "name_zh": "学位照 / 毕业图像采集", "aliases": ["毕业照采集"], "category": "中国常用", "mm": [40.6, 54.1], "dpi": 300, "px": [480, 639], "bg": ["blue"], "source": "行业惯例", "confidence": "D" },
+
+    { "id": "exam_cpta", "name_zh": "中国人事考试网（一建/执业药师/消防）", "aliases": ["人事考试"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "formats": ["jpg"] }, "note": "必须用官方照片审核处理工具（Photoprocess.exe）审核后才能上传", "source": "cpta.com.cn 官方", "confidence": "A" },
+    { "id": "exam_ncre", "name_zh": "全国计算机等级考试 NCRE", "aliases": ["计算机等级"], "category": "考试报名", "mm": [16.26, 12.19], "dpi": 300, "px": [192, 144], "bg": ["white", "lightgray"], "compose": { "head_measure_ratio": 0.2, "head_height_ratio": 0.5, "head_top_range": [0.1, 0.1] }, "upload": { "min_kb": 20, "max_kb": 200, "formats": ["jpg"] }, "note": "官方口径：最小 192×144px 且成像区不小于 48×33mm；头占 7/10、肩占 1/5、上空 1/10、左右各空 1/10；禁用生活照与美颜照", "source": "sdzk.cn 转发教育部考试院", "confidence": "A" },
+    { "id": "exam_ntce", "name_zh": "中小学教师资格考试 NTCE", "aliases": ["教资"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "max_kb": 200, "formats": ["jpg"] }, "note": "免冠、正面、彩色，白底", "source": "ntce.neea.edu.cn 官方", "confidence": "A" },
+    { "id": "exam_nurse", "name_zh": "护士执业资格考试", "aliases": ["护士资格"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "min_kb": 20, "max_kb": 45, "formats": ["jpg"] }, "note": "必须用官方照片审核处理工具处理后上传", "source": "21wecan.com 官方", "confidence": "A" },
+    { "id": "exam_yz", "name_zh": "研究生考试（研招网）", "aliases": ["考研"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "formats": ["jpg"] }, "note": "官方改为学信网 App 在线拍照并做图像质检，推荐他人用后置摄像头；强行美化会被报考点退回", "source": "yz.chsi.com.cn 官方（白底与质检要求已核）", "confidence": "A" },
+    { "id": "exam_gwy", "name_zh": "国家公务员考试", "aliases": ["国考"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white", "blue"], "source": "LiYing 与 Hivision 一致", "confidence": "B" },
+    { "id": "exam_kuaiji", "name_zh": "初级会计考试", "aliases": ["会计职称"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "source": "LiYing", "confidence": "B" },
+    { "id": "exam_gaokao", "name_zh": "高考报名", "aliases": ["高考"], "category": "考试报名", "mm": [40.64, 54.19], "dpi": 300, "px": [480, 640], "bg": ["white", "blue"], "upload": { "min_kb": 50, "max_kb": 200, "formats": ["jpg"] }, "note": "底色与大小因省而异", "source": "LiYing（标注因地区而异）", "confidence": "C" },
+    { "id": "exam_zikao", "name_zh": "自学考试", "aliases": ["自考"], "category": "考试报名", "mm": [12, 16], "dpi": 300, "px": [142, 189], "bg": ["white", "blue"], "source": "LiYing", "confidence": "C" },
+    { "id": "exam_putonghua", "name_zh": "普通话水平测试", "aliases": ["普通话"], "category": "考试报名", "mm": [33, 48], "dpi": 300, "px": [390, 567], "bg": ["white", "blue"], "upload": { "min_kb": 150, "max_kb": 300, "formats": ["jpg"] }, "source": "LiYing + idify 佐证", "confidence": "C" },
+    { "id": "exam_jlpt", "name_zh": "日本语能力考试 JLPT", "aliases": ["JLPT"], "category": "考试报名", "mm": [30, 40], "dpi": 300, "px": [354, 472], "bg": ["white"], "upload": { "min_kb": 20, "max_kb": 200, "formats": ["jpg"] }, "source": "LiYing", "confidence": "C" },
+    { "id": "exam_chengren", "name_zh": "成人高等教育考试", "aliases": ["成人高考"], "category": "考试报名", "mm": [48, 64], "dpi": 300, "px": [567, 756], "bg": ["white", "blue"], "upload": { "min_kb": 20, "max_kb": 6144, "formats": ["jpg"] }, "source": "LiYing", "confidence": "C" },
+    { "id": "exam_jsz_primary", "name_zh": "小学教师资格证（采集口径）", "aliases": ["小学教资"], "category": "考试报名", "mm": [12.7, 16.9], "dpi": 300, "px": [150, 200], "bg": ["white"], "upload": { "max_kb": 200, "formats": ["jpg"] }, "source": "LiYing", "confidence": "C" },
+    { "id": "exam_cet", "name_zh": "大学英语四六级 CET", "aliases": ["四六级", "CET"], "category": "考试报名", "mm": [12.19, 16.26], "dpi": 300, "px": [144, 192], "bg": ["white", "blue"], "upload": { "min_kb": 20, "max_kb": 200, "formats": ["jpg"] }, "note": "多数考点由学校统一导入学籍照片，个人上传口径请以本校通知为准", "source": "LiYing（与同平台 NCRE 口径同源）", "confidence": "C" },
+    { "id": "exam_ntce_alt", "name_zh": "教师资格证（另一口径）", "aliases": ["教资354x484"], "category": "考试报名", "mm": [30, 41], "dpi": 300, "px": [354, 484], "bg": ["white"], "source": "LiYing 同表并列的另一条；与 295×413 口径并存", "confidence": "C" },
+    { "id": "exam_constructor", "name_zh": "建造师等职业资格考试", "aliases": ["建造师"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "source": "行业惯例（多数职业资格考试沿用人事考试网口径）", "confidence": "D" },
+
+    { "id": "visa_us", "name_zh": "美国签证", "aliases": ["美签", "2x2英寸"], "category": "签证护照", "mm": [50.8, 50.8], "dpi": 300, "px": [600, 600], "bg": ["white"], "note": "2×2 英寸；要更高分辨率就在「输出设置」里把输出分辨率选成 600dpi（像素会跟着放大到 1200×1200，打印尺寸不变）", "source": "2×2 英寸；idify + LiYing + Hivision 三方一致", "confidence": "B" },
+    { "id": "visa_jp", "name_zh": "日本签证", "aliases": ["日签"], "category": "签证护照", "mm": [45, 45], "dpi": 300, "px": [531, 531], "bg": ["white"], "source": "idify；与 LiYing 的 531×531 吻合", "confidence": "B" },
+    { "id": "visa_kr", "name_zh": "韩国签证", "aliases": ["韩签"], "category": "签证护照", "mm": [35, 45], "dpi": 300, "px": [413, 531], "bg": ["white"], "source": "LiYing 与 Hivision 一致", "confidence": "B" },
+    { "id": "visa_schengen", "name_zh": "申根签证", "aliases": ["申根"], "category": "签证护照", "mm": [35, 45], "dpi": 300, "px": [413, 531], "bg": ["schengen", "white"], "note": "德/法/意/西/荷官方要求全部同值，头部占比 0.70~0.80", "source": "idify（多国同值交叉验证）", "confidence": "B" },
+    { "id": "visa_uk_print", "name_zh": "英国护照（打印）", "aliases": ["英签打印"], "category": "签证护照", "mm": [35, 45], "dpi": 300, "px": [413, 531], "bg": ["white"], "source": "idify united_kingdom_passport", "confidence": "B" },
+    { "id": "visa_uk_online", "name_zh": "英国护照（在线数字照）", "aliases": ["英签在线"], "category": "签证护照", "mm": [38.1, 50.8], "dpi": 600, "px": [900, 1200], "bg": ["white"], "upload": { "min_kb": 50, "max_kb": 10240, "formats": ["jpg"] }, "note": "官方要求：纯浅色背景、无阴影红眼、禁止任何软件修图、不得裁切", "source": "gov.uk/photos-for-passports 官方 + idify 自洽", "confidence": "A" },
+    { "id": "visa_au", "name_zh": "澳大利亚签证/护照", "aliases": ["澳洲签证"], "category": "签证护照", "mm": [35, 45], "dpi": 300, "px": [413, 531], "bg": ["schengen", "white"], "source": "idify（该条头部比例 min=max=0.8 可疑，仅取尺寸）", "confidence": "B" },
+    { "id": "visa_nz", "name_zh": "新西兰签证/护照", "aliases": ["新西兰签证"], "category": "签证护照", "mm": [35, 45], "dpi": 300, "px": [413, 531], "bg": ["schengen", "white"], "source": "idify", "confidence": "B" },
+    { "id": "visa_ca", "name_zh": "加拿大签证", "aliases": ["加签"], "category": "签证护照", "mm": [35, 45], "dpi": 300, "px": [413, 531], "bg": ["white"], "source": "idify", "confidence": "B" },
+    { "id": "visa_ca_passport", "name_zh": "加拿大护照", "aliases": ["加拿大护照"], "category": "签证护照", "mm": [50, 70], "dpi": 300, "px": [591, 827], "bg": ["white"], "note": "头部占比 0.443~0.514，明显小于他国的 0.7~0.8，勿套用通用构图", "source": "idify", "confidence": "B" },
+    { "id": "visa_cn", "name_zh": "中国签证", "aliases": ["中国签证"], "category": "签证护照", "mm": [33, 48], "dpi": 300, "px": [390, 567], "bg": ["white"], "source": "idify china_visa；与 LiYing 390×567 吻合", "confidence": "B" },
+    { "id": "visa_cn_online", "name_zh": "中国护照（在线上传）", "aliases": ["中国护照在线"], "category": "签证护照", "mm": [15, 20], "dpi": 600, "px": [354, 472], "bg": ["white"], "upload": { "max_kb": 120, "formats": ["jpg"] }, "source": "idify（maxKB=120）", "confidence": "B" },
+    { "id": "visa_in", "name_zh": "印度签证/护照", "aliases": ["印度签证"], "category": "签证护照", "mm": [50.8, 50.8], "dpi": 300, "px": [600, 600], "bg": ["white"], "source": "idify", "confidence": "B" },
+    { "id": "visa_icao", "name_zh": "国际通用（ICAO 标准）", "aliases": ["ICAO"], "category": "签证护照", "mm": [35, 45], "dpi": 300, "px": [413, 531], "bg": ["white", "schengen"], "note": "idify 全库 544 条中 35×45mm 占 43%，是国际默认值", "source": "idify 全库统计", "confidence": "B" }
+  ]
+}

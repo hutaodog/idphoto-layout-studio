@@ -1,0 +1,5 @@
+# 只装 Essentials：完整 PySide6 会拖进 Addons(40MB) 和 WebEngine(132MB)，本项目用不到，
+# 而且实测会把 C 盘（系统盘，剩余不足 1GB）撑爆。
+PySide6-Essentials
+pytest
+pyinstaller
