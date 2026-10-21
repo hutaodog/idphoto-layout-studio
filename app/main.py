@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -240,11 +241,89 @@ def selftest(out_dir: str, image: str = "") -> int:
     return 0 if report["ok"] else 1
 
 
+def run_apply_update(cfg: str, old_pid: int = 0) -> int:
+    """`--apply-update <apply.json> --old-pid <pid>`：**无界面**地把新版本覆盖上去。
+
+    这个进程就是"更新包里的新版本"，由旧版本用 `updater.spawn_applier()` 拉起。
+    它要做的三件事：等旧进程退出 → 覆盖文件 → 重新启动程序。
+
+    因为是无界面运行（没有控制台），结果写进程序目录的 `.logs/更新日志.txt`；
+    万一覆盖失败，会把旧版本再拉起来，别把用户晾在"什么都没有"的状态。
+    """
+    import json
+
+    from app.core import updater
+
+    lines = []
+    ok = False
+    try:
+        with open(cfg, "r", encoding="utf-8") as f:
+            plan = updater.UpdatePlan.from_dict(json.load(f))
+        res = updater.apply_plan(plan, old_pid=old_pid)
+        ok = not res["error"]
+        lines.append("plan     : %s" % json.dumps(plan.to_dict(), ensure_ascii=False))
+        lines.append("waited   : %s" % res["waited"])
+        lines.append("copied   : %d 个文件" % len(res["copied"]))
+        lines.append("restarted: %s" % res["restarted"])
+        if res["error"]:
+            lines.append("error    : %s" % res["error"])
+        if res.get("restart_error"):
+            lines.append("restart_error: %s" % res["restart_error"])
+        if not ok:
+            # 覆盖失败：把原来的程序拉起来（至少还能用旧版）
+            try:
+                import subprocess
+                subprocess.Popen([plan.target_exe], cwd=plan.target_dir, close_fds=True)
+                lines.append("已回退启动旧版本")
+            except Exception as e:                        # noqa: BLE001
+                lines.append("回退启动失败: %r" % (e,))
+    except Exception as e:                                # noqa: BLE001
+        lines.append("未预期的错误: %r" % (e,))
+    # 日志必须写到**被更新的那个程序目录**里：本进程是从 _update/ 里跑起来的，
+    # 那个目录落地后会被删掉，写在自己旁边等于白写。
+    try:
+        target = ""
+        try:
+            target = plan.target_dir               # noqa: F821 (上面的 plan 可能没绑定)
+        except Exception:                          # noqa: BLE001
+            from app.paths import app_dir as _app_dir
+            target = _app_dir()
+        log_dir = os.path.join(target, ".logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "更新日志.txt"), "a", encoding="utf-8") as f:
+            f.write("\n=== %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            f.write("\n".join(lines) + "\n")
+        # 更新失败要留个记号：用户只会看到"程序又开成旧版本了"，得告诉他为什么
+        note = os.path.join(log_dir, "更新失败.txt")
+        if ok:
+            try:
+                os.remove(note)
+            except OSError:
+                pass
+        else:
+            with open(note, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+    except Exception:                                     # noqa: BLE001
+        pass
+    return 0 if ok else 1
+
+
 def main() -> int:
     setup_streams()
     sys.excepthook = _excepthook
 
     argv = sys.argv[1:]
+    if "--apply-update" in argv:
+        i = argv.index("--apply-update")
+        cfg = argv[i + 1] if len(argv) > i + 1 else ""
+        pid = 0
+        if "--old-pid" in argv:
+            j = argv.index("--old-pid")
+            try:
+                pid = int(argv[j + 1])
+            except (IndexError, ValueError):
+                pid = 0
+        return run_apply_update(cfg, pid)
     if "--selftest" in argv:
         i = argv.index("--selftest")
         if len(argv) > i + 1 and not argv[i + 1].startswith("-"):

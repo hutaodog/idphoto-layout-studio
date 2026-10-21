@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
                                QColorDialog, QFileDialog, QFormLayout, QFrame,
@@ -40,10 +41,13 @@ from ..core.exporter import resample_to_dpi, save_image
 from ..core.layout import (DEFAULT_GAP_MM, DEFAULT_MARGIN_MM, plan_for_spec,
                            plan_layout, render_layout)
 from .. import __version__
+from ..core import updater
 from ..core.pipeline import ManualTransform, Processor
 from ..core.specs import SpecLibrary
 from . import chrome, layouts, style
 from .preview import PreviewCanvas
+from .update_dialog import UpdateDialog
+from .update_worker import UpdateCheckWorker
 from .widgets import (CheckBox, ColorSwatch, NoWheelComboBox, NoWheelDoubleSpinBox,
                       NoWheelSlider, NoWheelSpinBox, PillButton, show_message)
 from .worker import BatchExportWorker, ProcessWorker
@@ -179,6 +183,14 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
     def showEvent(self, event):                            # noqa: N802
         """第一次显示后挂毛玻璃（需要原生窗口句柄，不能在 __init__ 里做）。"""
         super().showEvent(event)
+        if not getattr(self, "_update_timers_armed", False):
+            # 更新相关：先清上次更新留下的临时文件，再（延时）静默查一次新版本。
+            # 都放进延时的定时器里，别让启动路径被网络/磁盘操作拖慢；
+            # 和"是不是无边框窗口"无关，所以放在最前面。
+            self._update_timers_armed = True
+            QTimer.singleShot(2000, updater.cleanup_stale)
+            QTimer.singleShot(2200, self._report_last_update)
+            QTimer.singleShot(4000, self._maybe_auto_check)
         if not self._frameless or getattr(self, "_glass_done", False):
             return
         self._glass_done = True
@@ -362,9 +374,112 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         m_file.addAction(a)
 
         m_help = self.menubar.addMenu("帮助")
+        self.act_check_update = QAction("检查更新…", self)
+        self.act_check_update.triggered.connect(lambda: self.on_check_update(silent=False))
+        m_help.addAction(self.act_check_update)
+
+        # 启动时自动检查（默认开）。存盘在 .update_state.json，关掉就彻底不联网。
+        st = updater.load_state()
+        self.act_auto_check = QAction("启动时自动检查更新", self)
+        self.act_auto_check.setCheckable(True)
+        self.act_auto_check.setChecked(bool(st.get("auto_check", True)))
+        self.act_auto_check.toggled.connect(self._on_auto_check_toggled)
+        m_help.addAction(self.act_auto_check)
+        m_help.addSeparator()
+
         a = QAction("关于 / 开源许可", self)
         a.triggered.connect(self.on_about)
         m_help.addAction(a)
+
+    # ==================== 检查更新 ====================
+    def _on_auto_check_toggled(self, on: bool) -> None:
+        updater.save_state(auto_check=bool(on))
+        self.status.showMessage("启动时自动检查更新：%s" % ("开" if on else "关"))
+
+    def _maybe_auto_check(self) -> None:
+        """启动后静默查一次（24 小时内只查一次，且可以在菜单里关掉）。"""
+        if os.environ.get("IDPHOTO_NO_UPDATE", "").strip().lower() in ("1", "on", "true"):
+            return
+        if not updater.should_auto_check():
+            return
+        self.on_check_update(silent=True)
+
+    def _report_last_update(self) -> None:
+        """上一次自动更新如果失败了，启动后主动告诉用户（不然他只会觉得"怎么还是旧版"）。"""
+        note = os.path.join(updater.app_dir(), ".logs", "更新失败.txt")
+        if not os.path.exists(note):
+            return
+        try:
+            with open(note, "r", encoding="utf-8", errors="replace") as f:
+                detail = f.read()[-1500:]
+        except OSError:
+            detail = ""
+        try:
+            os.remove(note)
+        except OSError:
+            pass
+        show_message(self, "上次自动更新没成功",
+                     "程序已经回到原来的版本，可以继续正常使用。\n\n"
+                     "想再试一次就点「帮助 → 检查更新…」；一直失败的话，"
+                     "建议直接去 Release 页面下载新的安装包。",
+                     kind="warn", detail=detail)
+
+    def on_check_update(self, silent: bool = False) -> None:
+        """查 GitHub 上有没有新版本。silent=True 是启动时的静默检查，失败不打扰用户。"""
+        if getattr(self, "_checking_update", False):
+            return
+        self._checking_update = True
+        if not silent:
+            self.status.showMessage("正在检查更新…")
+        w = UpdateCheckWorker(self)
+        w.ok.connect(lambda info: self._on_update_info(info, silent))
+        w.fail.connect(lambda msg: self._on_update_error(msg, silent))
+        w.finished.connect(lambda: setattr(self, "_checking_update", False))
+        self._update_checker = w          # 保住引用，别被 GC 掉
+        w.start()
+
+    def _on_update_info(self, info, silent: bool) -> None:
+        updater.save_state(last_check=time.time())
+        if not updater.is_newer(info.version, __version__):
+            if not silent:
+                show_message(self, "已是最新版本",
+                             "当前 v%s 就是最新版本。" % __version__, kind="info")
+            return
+        st = updater.load_state()
+        if silent and st.get("skipped") == info.version:
+            return                        # 用户说过"跳过这个版本"
+        self._open_update_dialog(info, auto=silent)
+
+    def _on_update_error(self, msg: str, silent: bool) -> None:
+        if silent:
+            self.status.showMessage("检查更新失败（不影响使用）")
+            return
+        show_message(self, "检查更新失败",
+                     "连不上 GitHub（或者被网络挡了）。\n\n"
+                     "可以稍后再试，或者直接去 Release 页面手动下载。",
+                     kind="warn", detail=msg)
+
+    def _open_update_dialog(self, info, auto: bool = False) -> None:
+        dlg = UpdateDialog(info, parent=self, auto_check=auto)
+        dlg.apply_requested.connect(self._apply_update)
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._update_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+
+    def _apply_update(self, plan) -> None:
+        """下载校验都做完了：启动新版本进程去覆盖，然后退出自己。"""
+        try:
+            updater.spawn_applier(plan, old_pid=os.getpid())
+        except Exception as e:                            # noqa: BLE001
+            show_message(self, "更新启动失败",
+                         "新版本已经下载好了，但没能把它启动起来。\n"
+                         "可以稍后再试，或者去 Release 页面手动下载。",
+                         kind="error", detail="%r\n%s" % (e, plan.staging))
+            return
+        self.status.showMessage("正在重启并更新到 v%s …" % (plan.version or ""))
+        QTimer.singleShot(250, self.close)
 
     def _build_toolbar(self) -> QToolBar:
         tb = QToolBar("主工具栏")
@@ -1386,4 +1501,9 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         for w in (self._worker, self._batch):
             if w is not None and w.isRunning():
                 w.wait(3000)
+        # 检查更新的线程可能还在跑：给一点时间收尾，别让 Qt 在销毁窗口时抱怨
+        checker = getattr(self, "_update_checker", None)
+        if checker is not None and checker.isRunning():
+            checker.wait(2000)
+            self._update_checker = None
         super().closeEvent(e)

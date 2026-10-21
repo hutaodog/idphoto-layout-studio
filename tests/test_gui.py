@@ -760,6 +760,74 @@ def test_app_icon_comes_from_the_user_source(qapp):
             need, need, sorted(sizes))
 
 
+def test_update_menu_and_auto_check_switch(win, qapp, monkeypatch, tmp_path):
+    """「帮助」菜单里要有检查更新 / 自动检查开关，开关状态要真的存盘。
+
+    自动检查**默认开**，但必须能被关掉（关掉就彻底不联网）；另外 `IDPHOTO_NO_UPDATE=1`
+    也要能一票否决（给无网环境和自检脚本用）。
+    """
+    from app.core import updater
+
+    monkeypatch.setattr(updater, "state_path", lambda: str(tmp_path / "st.json"))
+
+    help_menu = None
+    for a in win.menubar.actions():
+        if a.text() == "帮助":
+            help_menu = a.menu()
+    assert help_menu is not None, "菜单栏里没有「帮助」"
+    labels = [x.text() for x in help_menu.actions()]
+    assert "检查更新…" in labels, labels
+    assert "启动时自动检查更新" in labels, labels
+
+    win.act_auto_check.setChecked(False)
+    assert updater.load_state()["auto_check"] is False
+    win.act_auto_check.setChecked(True)
+    assert updater.load_state()["auto_check"] is True
+
+    called = []
+    monkeypatch.setattr(win, "on_check_update",
+                        lambda silent=False: called.append(silent))
+    monkeypatch.setenv("IDPHOTO_NO_UPDATE", "1")
+    win._maybe_auto_check()
+    assert called == [], "IDPHOTO_NO_UPDATE=1 时不许联网"
+
+    monkeypatch.delenv("IDPHOTO_NO_UPDATE")
+    updater.save_state(auto_check=True, last_check=updater.time.time())
+    win._maybe_auto_check()
+    assert called == [], "24 小时内不该重复查"
+
+
+def test_update_dialog_shows_version_and_skip(qapp, monkeypatch, tmp_path):
+    """更新对话框：标题带新版本号、能显示说明、选「跳过」要记到状态里。"""
+    from app.core import updater
+    from app.ui.update_dialog import UpdateDialog
+
+    monkeypatch.setattr(updater, "state_path", lambda: str(tmp_path / "st.json"))
+    info = updater.parse_release({
+        "tag_name": "v9.9.9", "name": "x", "body": "## 新功能\n- 一条说明",
+        "html_url": "https://example.invalid/r",
+        "assets": [{"name": "x-v9.9.9-portable.zip", "size": 1048576,
+                    "browser_download_url": "https://example.invalid/p.zip"}],
+    })
+    dlg = UpdateDialog(info, kind="folder")
+    try:
+        assert "9.9.9" in dlg.lbl_title.text()
+        assert dlg.btn_go.isEnabled(), "有资产时「下载并更新」应该可点"
+        assert "MB" in dlg.lbl_sub.text()
+        assert dlg.txt.toPlainText().strip(), "更新说明没显示出来"
+        dlg._on_skip()
+        assert updater.load_state()["skipped"] == "9.9.9"
+    finally:
+        dlg.close()
+
+    dlg2 = UpdateDialog(info, kind="source")     # 源码运行不自动更新
+    try:
+        assert dlg2.btn_go.isEnabled() is False
+        assert "手动下载" in dlg2.lbl_sub.text()
+    finally:
+        dlg2.close()
+
+
 def test_window_edges_are_not_resize_zones(win, qapp):
     """窗口**不能**拖边缘改大小（用户 v1.5.6："改成窗口默认不可随意拉拽调整窗口大小"）。
 

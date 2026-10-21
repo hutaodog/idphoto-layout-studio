@@ -19,7 +19,11 @@ _tmp/
 成品软件/
 输出/
 
-# ---- 运行时目录 ----
+# ---- 运行时目录（检查更新状态、日志）----
+.update_state.json
+app/.update_state.json
+.logs/
+
 .pytest_cache/
 _MEI*/
 *.log

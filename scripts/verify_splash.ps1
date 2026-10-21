@@ -105,6 +105,9 @@ function Test-Gui([string]$exe, [string]$tag) {
   $env:TMP = Join-Path $root '.tmp'
   $env:TEMP = $env:TMP
   Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue
+  # This is a GUI smoke test: do not let the app phone home for an update check
+  # (it would add a network request and possibly pop the update dialog).
+  $env:IDPHOTO_NO_UPDATE = '1'
 
   $snapshot = @(Get-Process -Name ([System.IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue |
                 Select-Object -ExpandProperty Id)
