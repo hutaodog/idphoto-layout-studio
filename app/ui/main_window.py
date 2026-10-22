@@ -99,7 +99,8 @@ class MainWindow(QMainWindow):
         self._batch: Optional[BatchExportWorker] = None
         self._pending_reprocess = False
         self._bg = "white"
-        self._out_dir = default_out_dir()
+        # 输出目录：用户设过的（settings.json）优先；没设过或那个目录已经不可用就用默认。
+        self._out_dir = self._saved_out_dir() or default_out_dir()
         self.layout_id = layouts.DEFAULT_LAYOUT
         self._layout_actions: Dict[str, QAction] = {}
         # 追加一段"毛玻璃模式"的覆盖样式：
@@ -115,6 +116,15 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         self._check_weights()
 
     # ==================== 界面搭建 ====================
+    @staticmethod
+    def _saved_out_dir() -> str:
+        """用户在 settings.json 里记住的输出目录（不可用就返回空串）。"""
+        try:
+            from ..core import settings as _settings
+            return _settings.get_out_dir()
+        except Exception:                                 # noqa: BLE001
+            return ""
+
     def _build_ui(self) -> None:
         """一次性搭建：窗口外壳 + 菜单 + 工具栏 + 状态栏，然后按布局装配主体。
 
@@ -425,42 +435,49 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
                      kind="warn", detail=detail)
 
     def on_check_update(self, silent: bool = False) -> None:
-        """查 GitHub 上有没有新版本。silent=True 是启动时的静默检查，失败不打扰用户。"""
+        """并发探测所有更新源，挑延迟最低的。silent=True 是启动时的静默检查，失败不打扰用户。"""
         if getattr(self, "_checking_update", False):
             return
         self._checking_update = True
         if not silent:
-            self.status.showMessage("正在检查更新…")
+            self.status.showMessage("正在检查更新（同时给自己节点和 GitHub 测速）…")
         w = UpdateCheckWorker(self)
-        w.ok.connect(lambda info: self._on_update_info(info, silent))
+        w.ok.connect(lambda best: self._on_update_info(best, silent))
         w.fail.connect(lambda msg: self._on_update_error(msg, silent))
         w.finished.connect(lambda: setattr(self, "_checking_update", False))
         self._update_checker = w          # 保住引用，别被 GC 掉
         w.start()
 
-    def _on_update_info(self, info, silent: bool) -> None:
+    def _on_update_info(self, best, silent: bool) -> None:
+        """best 是 updater.BestRelease（含所选源与测速结果）；兼容直接给 ReleaseInfo。"""
+        if isinstance(best, updater.BestRelease):
+            info, src, ms = best.info, best.source, best.latency_ms
+        else:
+            info, src, ms = best, None, 0.0
         updater.save_state(last_check=time.time())
         if not updater.is_newer(info.version, __version__):
             if not silent:
+                extra = "（更新源：%s %d ms）" % (src.name, int(ms)) if src else ""
                 show_message(self, "已是最新版本",
-                             "当前 v%s 就是最新版本。" % __version__, kind="info")
+                             "当前 v%s 就是最新版本。%s" % (__version__, extra),
+                             kind="info")
             return
         st = updater.load_state()
         if silent and st.get("skipped") == info.version:
             return                        # 用户说过"跳过这个版本"
-        self._open_update_dialog(info, auto=silent)
+        self._open_update_dialog(best, auto=silent)
 
     def _on_update_error(self, msg: str, silent: bool) -> None:
         if silent:
             self.status.showMessage("检查更新失败（不影响使用）")
             return
         show_message(self, "检查更新失败",
-                     "连不上 GitHub（或者被网络挡了）。\n\n"
+                     "所有更新源都连不上（GitHub 和你自己的节点）。\n\n"
                      "可以稍后再试，或者直接去 Release 页面手动下载。",
                      kind="warn", detail=msg)
 
-    def _open_update_dialog(self, info, auto: bool = False) -> None:
-        dlg = UpdateDialog(info, parent=self, auto_check=auto)
+    def _open_update_dialog(self, best, auto: bool = False) -> None:
+        dlg = UpdateDialog(best, parent=self, auto_check=auto)
         dlg.apply_requested.connect(self._apply_update)
         dlg.setModal(False)
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -827,6 +844,30 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         f.setVerticalSpacing(11)
         f.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        # ---- 输出目录（用户自定义 + 记住）----
+        # 以前只能靠在动作栏里那个后来被删掉的按钮改，界面上根本没有入口；
+        # 而且改完不存盘，重启就回到默认。现在：入口在这儿，选完写进 settings.json。
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        self.ed_out_dir = QLineEdit()
+        self.ed_out_dir.setReadOnly(True)
+        self.ed_out_dir.setText(self._out_dir)
+        self.ed_out_dir.setToolTip("导出（证件照 / 排版照 / 全部照片）会存到这个目录")
+        h.addWidget(self.ed_out_dir, 1)
+        self.btn_pick_out = QPushButton("选择…")
+        self.btn_pick_out.setObjectName("ghost")
+        self.btn_pick_out.setToolTip("换个目录存；选完之后下次打开也是这个目录")
+        self.btn_pick_out.clicked.connect(self.on_pick_out_dir)
+        h.addWidget(self.btn_pick_out)
+        self.btn_open_out = QPushButton("打开")
+        self.btn_open_out.setObjectName("ghost")
+        self.btn_open_out.clicked.connect(self.on_open_out_dir)
+        h.addWidget(self.btn_open_out)
+        f.addRow("输出目录", row)
+
         self.cmb_dpi = NoWheelComboBox()
         self.cmb_dpi.addItem("跟随规格（推荐）", 0)
         for d in (300, 350, 600):
@@ -889,8 +930,14 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
     def _update_out_label(self) -> None:
         d = self._out_dir
         short = d if len(d) <= 42 else ("…" + d[-41:])
-        self.lbl_out.setText("输出目录：%s" % short)
-        self.lbl_out.setToolTip(d)
+        if getattr(self, "lbl_out", None) is not None:
+            self.lbl_out.setText("输出目录：%s" % short)
+            self.lbl_out.setToolTip(d)
+        ed = getattr(self, "ed_out_dir", None)       # 「5 · 输出设置」里那行只读输入框
+        if ed is not None:
+            ed.setText(d)
+            ed.setToolTip(d)
+            ed.setCursorPosition(0)
 
     # ==================== 数据刷新 ====================
     def _check_weights(self) -> None:
@@ -1329,10 +1376,20 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     # ==================== 导出 ====================
     def on_pick_out_dir(self) -> None:
+        """选输出目录 —— **选完就写进 settings.json，重启还是它**。"""
         d = QFileDialog.getExistingDirectory(self, "选择输出目录", self._out_dir)
-        if d:
-            self._out_dir = d
-            self._update_out_label()
+        if not d:
+            return
+        d = os.path.abspath(d)
+        try:
+            from ..core import settings as _settings
+            _settings.set_out_dir(d)
+        except Exception as e:                            # noqa: BLE001
+            self.status.showMessage("输出目录已切换，但保存失败：%r" % (e,))
+        self._out_dir = d
+        self._update_out_label()
+        self.status.showMessage("输出目录已改为：%s（下次打开也是这里）" % d)
+        self._refresh_card_summaries()
 
     def on_open_out_dir(self) -> None:
         os.makedirs(self._out_dir, exist_ok=True)

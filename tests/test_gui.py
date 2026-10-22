@@ -828,6 +828,64 @@ def test_update_dialog_shows_version_and_skip(qapp, monkeypatch, tmp_path):
         dlg2.close()
 
 
+def test_output_dir_is_pickable_and_persists(win, qapp, monkeypatch, tmp_path):
+    """输出目录：能在界面里改，**改完重启也还是它**（用户明确要求）。
+
+    以前这个按钮在动作栏里、而动作栏被丢掉了 —— 界面上根本没有入口，而且改完不存盘。
+    现在「5 · 输出设置 → 输出目录」里能选，选完写进 settings.json。
+    """
+    import app.core.settings as st
+    from PySide6.QtWidgets import QFileDialog
+    from app.ui.main_window import MainWindow
+
+    monkeypatch.setattr(st, "settings_path", lambda: str(tmp_path / "settings.json"))
+    target = tmp_path / "我的证件照输出"
+    target.mkdir()
+    old = win._out_dir
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(target)))
+    try:
+        win.on_pick_out_dir()
+        assert win._out_dir == str(target)
+        assert st.get_out_dir() == str(target), "选完必须存盘"
+        assert win.ed_out_dir.text() == str(target), "输出设置里那行没跟着变"
+        assert target.is_dir()
+
+        # 模拟"重启"：新建一个窗口，应该直接用存下来的目录
+        w2 = MainWindow(SpecLibrary.load())
+        try:
+            assert w2._out_dir == str(target), "重启后没记住输出目录"
+        finally:
+            w2.close()
+    finally:
+        win._out_dir = old
+        win._update_out_label()
+
+
+def test_update_dialog_shows_source_and_latency(qapp, monkeypatch, tmp_path):
+    """更新对话框要显示"用的是哪个源、延迟多少"（多源测速的可见结果）。"""
+    from app.core import updater
+    from app.ui.update_dialog import UpdateDialog
+
+    monkeypatch.setattr(updater, "state_path", lambda: str(tmp_path / "st.json"))
+    info = updater.ReleaseInfo(version="9.9.9", assets=[
+        updater.Asset("x-v9.9.9-portable.zip", "u", 1048576)])
+    fast = updater.SourceResult(updater.Source("自建节点", "manifest", "http://x/u.json"),
+                                58.0, info, "")
+    slow = updater.SourceResult(updater.Source("GitHub", "github", "https://api"),
+                                700.0, info, "")
+    best = updater.BestRelease(info=info, source=fast.source,
+                               latency_ms=fast.latency_ms, candidates=[fast, slow])
+    dlg = UpdateDialog(best, kind="folder")
+    try:
+        text = dlg.lbl_source.text()
+        assert "自建节点" in text and "58" in text, text
+        assert "GitHub" in text, "多源时要把对比也列出来：%s" % text
+        assert dlg.btn_go.isEnabled()
+    finally:
+        dlg.close()
+
+
 def test_window_edges_are_not_resize_zones(win, qapp):
     """窗口**不能**拖边缘改大小（用户 v1.5.6："改成窗口默认不可随意拉拽调整窗口大小"）。
 

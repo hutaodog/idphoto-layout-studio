@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Optional
+from typing import List, Optional, Sequence
 
 from PySide6.QtCore import QThread, Signal
 
@@ -15,33 +15,35 @@ from ..core import updater
 
 
 class UpdateCheckWorker(QThread):
-    """查 GitHub 上有没有新版本。"""
+    """并发探测所有更新源（GitHub + 自建节点…），挑延迟最低的那个。"""
 
-    ok = Signal(object)          # ReleaseInfo
+    ok = Signal(object)          # updater.BestRelease
     fail = Signal(str)
 
-    def __init__(self, parent=None, timeout: float = 20.0):
+    def __init__(self, parent=None, timeout: float = updater.PROBE_TIMEOUT_S,
+                 sources: Optional[Sequence[updater.Source]] = None):
         super().__init__(parent)
         self.timeout = timeout
+        self.sources = list(sources) if sources else None
 
     def run(self):                                          # noqa: D401
         try:
-            self.ok.emit(updater.fetch_latest(timeout=self.timeout))
+            self.ok.emit(updater.fetch_latest_best(self.sources, self.timeout))
         except Exception as e:                              # noqa: BLE001
             self.fail.emit(str(e) or repr(e))
 
 
 class UpdateDownloadWorker(QThread):
-    """下载新版本（含校验 + 解压），返回 UpdatePlan。"""
+    """用测速选出来的源下载新版本（含校验 + 解压），返回 UpdatePlan。"""
 
     progress = Signal(int, int)      # 已下字节, 总字节（总长未知时为 0）
     ok = Signal(object)              # UpdatePlan
     fail = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, info, kind: Optional[str] = None, parent=None):
+    def __init__(self, best, kind: Optional[str] = None, parent=None):
         super().__init__(parent)
-        self.info = info
+        self.best = best                  # updater.BestRelease
         self.kind = kind
         self._stop = threading.Event()
 
@@ -53,8 +55,8 @@ class UpdateDownloadWorker(QThread):
 
     def run(self):                                          # noqa: D401
         try:
-            plan = updater.prepare_update(
-                self.info, kind=self.kind,
+            plan, _best = updater.prepare_update_best(
+                kind=self.kind, best=self.best,
                 progress=lambda done, total: self.progress.emit(int(done), int(total)),
                 should_stop=self._should_stop)
             if self._stop.is_set():
@@ -65,3 +67,17 @@ class UpdateDownloadWorker(QThread):
             self.cancelled.emit()
         except Exception as e:                              # noqa: BLE001
             self.fail.emit(str(e) or repr(e))
+
+
+def describe_sources(best) -> List[str]:
+    """把"每个源的延迟/结果"整理成可读的行（对话框里展示用）。"""
+    lines = []
+    chosen = getattr(best, "source", None)
+    for r in getattr(best, "candidates", []) or []:
+        if r.ok:
+            mark = "[*]" if r.source is chosen else "[ ]"
+            lines.append("%s %s：%d ms，v%s" % (
+                mark, r.source.name, int(r.latency_ms), r.info.version))
+        else:
+            lines.append("[x] %s：不可用（%s）" % (r.source.name, (r.error or "")[:60]))
+    return lines

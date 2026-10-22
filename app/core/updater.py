@@ -42,11 +42,17 @@ RELEASES_PAGE = "https://github.com/%s/releases/latest" % REPO
 MIRRORS: Tuple[str, ...] = ("", "https://gh-proxy.com/", "https://ghfast.top/",
                             "https://ghproxy.net/")
 
+# 自定义更新源（静态 update.json）：默认给的是用户自己的节点，可在 settings.json 里改/加。
+# 这类静态源**不走 gh-proxy**（那些代理只对 GitHub 有用）。
+DEFAULT_SOURCE_NAME = "自建节点"
+
 UA = "idphoto-layout-studio-updater/1.0 (+https://github.com/%s)" % REPO
 CHUNK = 256 * 1024
 UPDATE_DIR_NAME = "_update"
 STATE_FILE_NAME = ".update_state.json"
 CHECK_INTERVAL_S = 24 * 3600        # 启动时自动检查的间隔（24 小时）
+PROBE_TIMEOUT_S = 8.0               # 单源测速超时
+SLOW_PROBE_MS = 4000.0              # 超过这个延迟就提示"网络较慢"
 
 _FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -114,18 +120,23 @@ class UpdatePlan:
     payload: str                     # 新 exe 或解压后的目录
     version: str = ""
     created: float = field(default_factory=time.time)
+    source: str = ""                 # 这次从哪个源下的（写进更新日志，方便排查）
+    latency_ms: float = 0.0
 
     def to_dict(self) -> Dict:
         return {"mode": self.mode, "staging": self.staging,
                 "target_dir": self.target_dir, "target_exe": self.target_exe,
                 "payload": self.payload, "version": self.version,
-                "created": self.created}
+                "created": self.created, "source": self.source,
+                "latency_ms": self.latency_ms}
 
     @classmethod
     def from_dict(cls, d: Dict) -> "UpdatePlan":
         return cls(mode=d["mode"], staging=d["staging"], target_dir=d["target_dir"],
                    target_exe=d["target_exe"], payload=d["payload"],
-                   version=d.get("version", ""), created=d.get("created", 0.0))
+                   version=d.get("version", ""), created=d.get("created", 0.0),
+                   source=d.get("source", ""),
+                   latency_ms=float(d.get("latency_ms") or 0.0))
 
 
 # ============================================================== 当前安装形态
@@ -207,8 +218,10 @@ def should_auto_check(state: Optional[Dict] = None) -> bool:
 
 # ============================================================== 网络
 def _get(url: str, timeout: float) -> bytes:
-    req = Request(url, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
-    with urlopen(req, timeout=timeout) as resp:            # noqa: S310 (固定 https 地址)
+    req = Request(url, headers={"User-Agent": UA,
+                                "Accept": "application/json, */*",
+                                "Cache-Control": "no-cache"})
+    with urlopen(req, timeout=timeout) as resp:            # noqa: S310 (地址来自常量/设置)
         return resp.read()
 
 
@@ -259,6 +272,165 @@ def pick_asset(info: ReleaseInfo, kind: Optional[str] = None) -> Optional[Asset]
     if asset is None and info.assets:                      # 名字对不上时退而求其次
         asset = info.assets[0]
     return asset
+
+
+# ============================================================== 更新源 + 测速
+@dataclass
+class Source:
+    """一个更新源。
+
+    * `kind="github"`  → url 是 GitHub 的 releases/latest API；
+      资产地址就是 `browser_download_url`，下载时还可以套 gh-proxy 反代。
+    * `kind="manifest"`→ url 是一个**静态** JSON（见 `parse_manifest`），
+      通常放在自己的服务器/对象存储上；资产地址支持相对路径。
+    """
+    name: str
+    kind: str
+    url: str
+
+    @property
+    def is_github(self) -> bool:
+        return self.kind == "github"
+
+    def __str__(self) -> str:                              # 界面上直接显示
+        return self.name
+
+
+@dataclass
+class SourceResult:
+    source: Source
+    latency_ms: float = 0.0
+    info: Optional[ReleaseInfo] = None
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.info is not None and not self.error
+
+
+@dataclass
+class BestRelease:
+    """权衡之后选中的源 + 它的 release 信息。"""
+    info: ReleaseInfo
+    source: Source
+    latency_ms: float
+    candidates: List[SourceResult] = field(default_factory=list)
+
+    @property
+    def latency_text(self) -> str:
+        return "%d ms" % int(self.latency_ms)
+
+
+def default_sources(extra: Optional[Sequence[str]] = None) -> List[Source]:
+    """GitHub + 设置里的自定义静态源（`update_sources` 里的 URL）。"""
+    sources = [Source("GitHub", "github", API_LATEST)]
+    urls = list(extra or [])
+    if not urls:
+        try:
+            from . import settings
+            urls = settings.get_update_sources()
+        except Exception:                                  # noqa: BLE001
+            urls = []
+    for i, url in enumerate(urls):
+        url = str(url or "").strip()
+        if not url:
+            continue
+        if url == API_LATEST:
+            continue
+        sources.append(Source("%s %d" % (DEFAULT_SOURCE_NAME, i + 1)
+                              if len(urls) > 1 else DEFAULT_SOURCE_NAME,
+                              "manifest", url))
+    return sources
+
+
+def probe_and_fetch(source: Source, timeout: float = PROBE_TIMEOUT_S) -> SourceResult:
+    """请求一次源，返回 (延迟, 解析结果)。**一次请求同时完成"测速"和"取版本"**。"""
+    t0 = time.perf_counter()
+    try:
+        raw = _get(source.url, timeout)
+        latency = (time.perf_counter() - t0) * 1000.0
+        payload = json.loads(raw.decode("utf-8", "replace"))
+        if source.is_github:
+            info = parse_release(payload)
+        else:
+            info = parse_manifest(payload, base_url=source.url)
+        if not info.version:
+            return SourceResult(source, latency, None, "源里没有版本号")
+        return SourceResult(source, latency, info, "")
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as e:
+        return SourceResult(source, (time.perf_counter() - t0) * 1000.0, None,
+                            "%s: %s" % (type(e).__name__, e))
+
+
+def probe_sources(sources: Sequence[Source],
+                  timeout: float = PROBE_TIMEOUT_S) -> List[SourceResult]:
+    """并发探测所有源（别串起来等，慢源会把快的拖死）。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not sources:
+        return []
+    with ThreadPoolExecutor(max_workers=min(4, len(sources))) as pool:
+        futures = [pool.submit(probe_and_fetch, s, timeout) for s in sources]
+        return [f.result() for f in futures]
+
+
+def fetch_latest_best(sources: Optional[Sequence[Source]] = None,
+                      timeout: float = PROBE_TIMEOUT_S) -> BestRelease:
+    """所有源一起测速，挑**延迟最低且确实报出版本号**的那个。
+
+    一个源挂了不影响别的；全挂才抛错（错误信息里带上每个源的原因）。
+    """
+    srcs = list(sources or default_sources())
+    results = probe_sources(srcs, timeout)
+    healthy = [r for r in results if r.ok]
+    if not healthy:
+        detail = "\n".join("  %s -> %s" % (r.source.name, r.error or "无数据")
+                           for r in results) or "  （没有配置任何源）"
+        raise URLError("检查更新失败：所有更新源都不通\n" + detail)
+    # 延迟低的优先；延迟相同则版本高的优先
+    healthy.sort(key=lambda r: (r.latency_ms, -parse_version(r.info.version)[0]))
+    best = healthy[0]
+    return BestRelease(info=best.info, source=best.source,
+                       latency_ms=best.latency_ms, candidates=results)
+
+
+def parse_manifest(payload: Dict, base_url: str = "") -> ReleaseInfo:
+    """解析自定义静态源的 `update.json`。
+
+    ```json
+    {
+      "version": "1.6.1",
+      "notes": "更新说明（Markdown）",
+      "page_url": "https://github.com/.../releases/tag/v1.6.1",
+      "assets": [
+        {"name": "idphoto-layout-studio-v1.6.1-portable.zip",
+         "url": "idphoto-layout-studio-v1.6.1-portable.zip",   // 相对路径也行
+         "size": 137101385, "sha256": "…"}
+      ]
+    }
+    ```
+    为了宽容，也认 `assets` 里用 `browser_download_url` / `digest` 的写法（和 GitHub 一样）。
+    """
+    from urllib.parse import urljoin
+
+    version = str(payload.get("version") or payload.get("tag_name") or "").lstrip("vV")
+    assets: List[Asset] = []
+    for a in payload.get("assets") or []:
+        raw_url = str(a.get("url") or a.get("browser_download_url") or "")
+        digest = str(a.get("digest") or "")
+        sha = str(a.get("sha256") or "")
+        if not sha and digest.lower().startswith("sha256:"):
+            sha = digest.split(":", 1)[1]
+        assets.append(Asset(name=str(a.get("name") or ""),
+                            url=urljoin(base_url, raw_url) if raw_url else "",
+                            size=int(a.get("size") or 0), sha256=sha))
+    return ReleaseInfo(version=version,
+                       tag=str(payload.get("tag") or ("v" + version if version else "")),
+                       name=str(payload.get("name") or ("v" + version if version else "")),
+                       notes=str(payload.get("notes") or payload.get("body") or ""),
+                       page_url=str(payload.get("page_url") or payload.get("html_url")
+                                    or RELEASES_PAGE),
+                       assets=assets)
 
 
 def sha256_file(path: str) -> str:
@@ -325,10 +497,12 @@ def download(url: str, dest: str, size: int = 0, sha256: str = "",
 def prepare_update(info: ReleaseInfo, kind: Optional[str] = None,
                    progress: Optional[Callable[[int, int], None]] = None,
                    mirrors: Sequence[str] = MIRRORS,
-                   should_stop: Optional[Callable[[], bool]] = None) -> UpdatePlan:
+                   should_stop: Optional[Callable[[], bool]] = None,
+                   source_name: str = "", latency_ms: float = 0.0) -> UpdatePlan:
     """下载资产、解压（zip）、写 apply.json，返回更新计划。
 
     调用方拿到计划后：`spawn_applier(plan)` 启动新版本进程，然后退出自己。
+    `mirrors` 只对 GitHub 资产有意义（公共反代）；自建静态源传 `("",)`。
     """
     kind = kind or build_kind()
     asset = pick_asset(info, kind)
@@ -349,7 +523,8 @@ def prepare_update(info: ReleaseInfo, kind: Optional[str] = None,
         shutil.copyfile(dest, new_exe)
         plan = UpdatePlan(mode="replace-exe", staging=staging,
                           target_dir=target_dir, target_exe=me,
-                          payload=new_exe, version=info.version)
+                          payload=new_exe, version=info.version,
+                          source=source_name, latency_ms=latency_ms)
     else:
         staged = os.path.join(staging, "staged")
         if os.path.isdir(staged):
@@ -362,11 +537,43 @@ def prepare_update(info: ReleaseInfo, kind: Optional[str] = None,
             shutil.copyfile(dest, os.path.join(staged, asset.name))
         plan = UpdatePlan(mode="extract-copy", staging=staging,
                           target_dir=target_dir, target_exe=me,
-                          payload=staged, version=info.version)
+                          payload=staged, version=info.version,
+                          source=source_name, latency_ms=latency_ms)
 
     with open(os.path.join(staging, "apply.json"), "w", encoding="utf-8") as f:
         json.dump(plan.to_dict(), f, ensure_ascii=False, indent=2)
     return plan
+
+
+def prepare_update_best(sources: Optional[Sequence[Source]] = None,
+                        kind: Optional[str] = None,
+                        progress: Optional[Callable[[int, int], None]] = None,
+                        should_stop: Optional[Callable[[], bool]] = None,
+                        timeout: float = PROBE_TIMEOUT_S,
+                        best: Optional[BestRelease] = None):
+    """测速 → 用**延迟最低的源**下载；它要是失败就按延迟顺序换下一个源。
+
+    返回 (UpdatePlan, BestRelease)。
+    """
+    best = best or fetch_latest_best(sources, timeout)
+    order = sorted([r for r in best.candidates if r.ok], key=lambda r: r.latency_ms)
+    if not order:
+        order = [SourceResult(best.source, best.latency_ms, best.info, "")]
+    errors = []
+    for r in order:
+        try:
+            plan = prepare_update(
+                r.info, kind=kind, progress=progress, should_stop=should_stop,
+                mirrors=MIRRORS if r.source.is_github else ("",),
+                source_name=r.source.name, latency_ms=r.latency_ms)
+            return plan, BestRelease(info=r.info, source=r.source,
+                                     latency_ms=r.latency_ms,
+                                     candidates=best.candidates)
+        except UpdateCancelled:
+            raise
+        except Exception as e:                             # noqa: BLE001
+            errors.append("%s（%d ms）-> %s" % (r.source.name, int(r.latency_ms), e))
+    raise URLError("下载失败：所有更新源都没成功\n" + "\n".join(errors))
 
 
 def applier_exe(plan: UpdatePlan) -> str:

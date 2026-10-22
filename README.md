@@ -49,8 +49,35 @@
 
 - 启动后静默检查新版本（24 小时一次），发现更新会展示版本说明，点一下就下载并自动替换、
   自动重启到新版本；不想更可以「以后再说」或「跳过这个版本」
-- 下载走 GitHub，直连不通自动回退到镜像；下载后按 Release 的 `sha256` 校验
+- **多源测速**：同时探测「GitHub」和自建节点（静态 `update.json`），**用延迟最低的那个下载**，
+  它失败了自动换下一个；对话框里会显示每个源的延迟
+- 下载走 GitHub（直连不通自动回退镜像）或自建节点；下载后按 `sha256` 校验
 - 可以在「帮助」菜单里关掉自动检查（关掉后程序完全不联网），`IDPHOTO_NO_UPDATE=1` 也能一票否决
+
+### 自建更新节点（可选，国内下载更快）
+
+程序支持把更新包放在自己的服务器上，检查更新时和 GitHub 一起测速、谁快用谁：
+
+```powershell
+# 1. 打包（产出 成品软件\ 里的三个产物）
+.\scripts\package_release.ps1
+
+# 2. 一键生成节点需要的文件 → 成品软件\update\
+.\.venv\Scripts\python.exe scripts\make_update_manifest.py --notes-file notes.md
+
+# 3. 把 成品软件\update\ 里的全部文件上传到你的目录，例如 http://你的域名/update/
+#    确认匿名能打开 http://你的域名/update/update.json 即可
+```
+
+节点地址写在**程序目录**的 `settings.json` 里（可以写多个）：
+
+```json
+{ "update_sources": ["http://8.133.208.128/update/update.json"] }
+```
+
+> 注意：节点必须能**匿名**访问（云盘面板要登录的话，请放到静态目录或用直链）；
+> `update.json` 里用的是相对路径，整个目录搬走不用改内容；
+> 更新包文件名必须以 `-portable.zip` / `-onefile.exe` / `-setup.exe` 结尾（程序按后缀挑包）。
 
 ---
 

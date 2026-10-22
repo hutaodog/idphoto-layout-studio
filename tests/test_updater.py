@@ -223,6 +223,101 @@ def test_cleanup_stale_removes_leftovers(tmp_path, monkeypatch):
     assert (tmp_path / "keep.exe").exists()
 
 
+# ------------------------------------------------------------------ 多源 + 测速
+def _src(name, kind="manifest", url="https://example.invalid/u.json"):
+    return up.Source(name, kind, url)
+
+
+def test_probe_sources_picks_the_fastest(monkeypatch):
+    """并发测速后必须选**延迟最低**的那个源（这就是"哪个快用哪个"）。"""
+    def fake_probe(source, timeout=8.0):
+        table = {
+            "GitHub": (700.0, "1.9.9", ""),
+            "自建节点 1": (58.0, "1.9.9", ""),
+            "自建节点 2": (5.0, "", "404"),          # 更快但没数据 → 不能用
+        }
+        ms, ver, err = table.get(source.name, (999.0, "", "unknown"))
+        if err:
+            return up.SourceResult(source, ms, None, err)
+        info = up.ReleaseInfo(version=ver, tag="v" + ver,
+                              assets=[up.Asset("x-v%s-portable.zip" % ver, "u", 1, "")])
+        return up.SourceResult(source, ms, info, "")
+
+    monkeypatch.setattr(up, "probe_and_fetch", fake_probe)
+    srcs = [_src("GitHub", "github"), _src("自建节点 1"), _src("自建节点 2")]
+    best = up.fetch_latest_best(srcs)
+    assert best.source.name == "自建节点 1"
+    assert abs(best.latency_ms - 58.0) < 1
+    assert best.info.version == "1.9.9"
+    assert len(best.candidates) == 3
+
+
+def test_fetch_latest_best_fails_loudly_when_all_sources_are_down(monkeypatch):
+    monkeypatch.setattr(up, "probe_and_fetch",
+                        lambda s, timeout=8.0: up.SourceResult(s, 1.0, None, "boom"))
+    with pytest.raises(Exception) as e:
+        up.fetch_latest_best([_src("A"), _src("B")])
+    assert "所有更新源" in str(e.value)
+
+
+def test_parse_manifest_resolves_relative_urls():
+    payload = {
+        "version": "1.7.0",
+        "notes": "## 说明\n- 一条",
+        "page_url": "https://example.invalid/r",
+        "assets": [
+            {"name": "x-v1.7.0-portable.zip", "url": "x-v1.7.0-portable.zip",
+             "size": 100, "sha256": "c" * 64},
+            {"name": "x-v1.7.0-onefile.exe",
+             "url": "https://cdn.example.invalid/x-v1.7.0-onefile.exe",
+             "size": 200, "digest": "sha256:" + "d" * 64},
+        ],
+    }
+    info = up.parse_manifest(payload, base_url="http://host:8080/update/update.json")
+    assert info.version == "1.7.0" and info.tag == "v1.7.0"
+    assert "一条" in info.notes
+    a = info.asset_named("-portable.zip")
+    assert a.url == "http://host:8080/update/x-v1.7.0-portable.zip", a.url
+    b = info.asset_named("-onefile.exe")
+    assert b.url.startswith("https://cdn.example.invalid/") and b.sha256 == "d" * 64
+
+
+def test_default_sources_includes_custom_urls(monkeypatch, tmp_path):
+    import app.core.settings as st
+    monkeypatch.setattr(st, "settings_path", lambda: str(tmp_path / "settings.json"))
+    srcs = up.default_sources(["http://host/update/update.json"])
+    assert srcs[0].name == "GitHub"
+    assert len(srcs) == 2 and srcs[1].kind == "manifest"
+    assert srcs[1].url == "http://host/update/update.json"
+
+
+def test_prepare_update_best_falls_back_to_next_source(tmp_path, monkeypatch):
+    """最快的源下载失败 → 自动换下一个（用户不用管）。"""
+    good_zip = tmp_path / "good.zip"
+    _make_zip(good_zip, {"app.exe": b"NEW"})
+
+    def fake_fetch(sources=None, timeout=8.0):
+        # 快的那个给出的是坏地址（下载必失败），慢的那个才有真文件
+        slow = up.SourceResult(_src("慢的"), 900.0,
+                               up.ReleaseInfo(version="9.9.9", assets=[
+                                   up.Asset("x-portable.zip", good_zip.as_uri(),
+                                            good_zip.stat().st_size, "")]), "")
+        fast = up.SourceResult(_src("快的"), 20.0,
+                               up.ReleaseInfo(version="9.9.9", assets=[
+                                   up.Asset("x-portable.zip", "http://127.0.0.1:1/x.zip",
+                                            1, "")]), "")
+        return up.BestRelease(info=fast.info, source=fast.source,
+                              latency_ms=fast.latency_ms, candidates=[fast, slow])
+
+    monkeypatch.setattr(up, "fetch_latest_best", fake_fetch)
+    monkeypatch.setattr(up, "update_dir", lambda: str(tmp_path / "_update"))
+    monkeypatch.setattr(up, "app_dir", lambda: str(tmp_path / "app"))
+    (tmp_path / "app").mkdir()
+    plan, best = up.prepare_update_best(kind="folder", timeout=5)
+    assert os.path.exists(os.path.join(plan.payload, "app.exe"))
+    assert best.source.name == "慢的", "最快的那个失败了，应该退到下一个"
+
+
 # ------------------------------------------------------------------ 无界面落地入口
 def test_run_apply_update_cli_entry(tmp_path, monkeypatch):
     """`--apply-update` 那个无界面入口真跑一遍：覆盖成功 → 返回 0 → 写更新日志。"""

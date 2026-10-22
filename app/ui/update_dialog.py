@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QProgressBa
 from ..core import updater
 from .. import __version__
 from . import style
-from .update_worker import UpdateDownloadWorker
+from .update_worker import UpdateDownloadWorker, describe_sources
 
 
 class UpdateDialog(QDialog):
@@ -31,10 +31,19 @@ class UpdateDialog(QDialog):
     apply_requested = Signal(object)      # UpdatePlan
     skipped = Signal(str)                 # 版本号
 
-    def __init__(self, info: updater.ReleaseInfo, parent=None,
+    def __init__(self, best, parent=None,
                  kind: Optional[str] = None, auto_check: bool = False):
+        """`best` 可以是 `updater.BestRelease`（带测速结果），也可以直接是 `ReleaseInfo`。"""
         super().__init__(parent)
-        self.info = info
+        if isinstance(best, updater.BestRelease):
+            self.best = best
+            self.info = best.info
+        else:                                  # 兼容只给 ReleaseInfo 的调用（测试/降级）
+            self.info = best
+            self.best = updater.BestRelease(
+                info=best, source=updater.Source("GitHub", "github", updater.API_LATEST),
+                latency_ms=0.0, candidates=[])
+        info = self.info
         self.kind = kind or updater.build_kind()
         self.asset = updater.pick_asset(info, self.kind)
         self.plan = None
@@ -64,7 +73,7 @@ class UpdateDialog(QDialog):
         head.addWidget(self.lbl_cur)
         v.addLayout(head)
 
-        # ---- 副标题（下载哪个包 / 多大）----
+        # ---- 副标题（从哪个源、下哪个包、多大）----
         if self.asset is not None:
             sub = "将下载 %s（%.1f MB）并自动更新" % (
                 "单文件版" if self.kind == "single" else "便携文件夹版", self.asset.mb)
@@ -74,6 +83,14 @@ class UpdateDialog(QDialog):
         self.lbl_sub.setStyleSheet("color:%s;font-size:12px;" % style.MUTED_STRONG)
         self.lbl_sub.setWordWrap(True)
         v.addWidget(self.lbl_sub)
+
+        # ---- 更新源与测速结果（多个源时把每个源的延迟都列出来）----
+        self.lbl_source = QLabel(self._source_text())
+        self.lbl_source.setStyleSheet("color:%s;font-size:12px;" % style.MUTED)
+        self.lbl_source.setWordWrap(True)
+        self.lbl_source.setToolTip("程序会并发测一遍所有更新源的延迟，用最快的那个下载；"
+                                   "它要是失败会自动换下一个。")
+        v.addWidget(self.lbl_source)
 
         # ---- 更新说明（GitHub 的 body 是 Markdown，用 QTextBrowser 渲染，别直接怼原文）----
         self.txt = QTextBrowser()
@@ -140,6 +157,22 @@ class UpdateDialog(QDialog):
             self.lbl_progress.setVisible(True)
             self.lbl_progress.setText("启动时自动检查发现的更新；可在「帮助」菜单里关掉自动检查。")
 
+    # ------------------------------------------------------------------ 文案
+    def _source_text(self) -> str:
+        """「更新源：自建节点 1（58 ms）」+ 其它源的测速结果（只在有多个源时列出）。"""
+        rows = describe_sources(self.best)
+        chosen = self.best.source
+        text = "更新源：%s（%d ms）" % (chosen.name, int(self.best.latency_ms or 0))
+        if len([r for r in (self.best.candidates or []) if r.ok]) > 1:
+            text += "　·　测速对比：" + "　".join(
+                "%s %dms" % (r.source.name, int(r.latency_ms))
+                for r in self.best.candidates if r.ok)
+        elif rows and len(rows) > 1:
+            text += "　·　其它源不可用"
+        if (self.best.latency_ms or 0) > updater.SLOW_PROBE_MS:
+            text += "　·　网络较慢，可以稍后再试"
+        return text
+
     # ------------------------------------------------------------------ 动作
     def _open_page(self) -> None:
         QDesktopServices.openUrl(QUrl(self.info.page_url or updater.RELEASES_PAGE))
@@ -163,7 +196,7 @@ class UpdateDialog(QDialog):
         self.lbl_progress.setText("正在下载…")
         self.btn_go.setText("正在下载…")
 
-        w = UpdateDownloadWorker(self.info, self.kind, parent=self)
+        w = UpdateDownloadWorker(self.best, self.kind, parent=self)
         w.progress.connect(self._on_progress)
         w.ok.connect(self._on_downloaded)
         w.fail.connect(self._on_failed)
