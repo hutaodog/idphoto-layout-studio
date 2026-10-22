@@ -349,4 +349,30 @@ def test_run_apply_update_cli_entry(tmp_path, monkeypatch):
     # 日志写在**被更新的程序目录**里（applier 自己所在的 _update 会被删掉）
     log = target / ".logs" / "更新日志.txt"
     assert log.exists() and "copied" in log.read_text(encoding="utf-8")
+
+
+def test_apply_update_tolerates_bom_in_plan(tmp_path, monkeypatch):
+    """apply.json 前面被加了 UTF-8 BOM 也要能读。
+
+    实测踩过：PowerShell 的 `Set-Content -Encoding UTF8` 会写 BOM，
+    而 `json.load(open(..., encoding="utf-8"))` 会直接报 "Unexpected UTF-8 BOM"，
+    表现是"点了更新什么都没发生、退出码 1、没有日志"。
+    """
+    from app import main as app_main
+
+    target = tmp_path / "app"
+    target.mkdir()
+    staged = tmp_path / "_update" / "staged"
+    staged.mkdir(parents=True)
+    (staged / "app.exe").write_bytes(b"NEW")
+    plan = up.UpdatePlan(mode="extract-copy", staging=str(tmp_path / "_update"),
+                         target_dir=str(target), target_exe=str(target / "app.exe"),
+                         payload=str(staged), version="9.9.9")
+    cfg = tmp_path / "_update" / "apply.json"
+    cfg.write_bytes(b"\xef\xbb\xbf" + json.dumps(plan.to_dict()).encode("utf-8"))
+
+    monkeypatch.setattr("app.paths.app_dir", lambda: str(tmp_path))
+    code = app_main.run_apply_update(str(cfg), old_pid=0)
+    assert code == 0, "带 BOM 的计划文件应该照常执行"
+    assert (target / "app.exe").read_bytes() == b"NEW"
     assert not (target / ".logs" / "更新失败.txt").exists(), "成功了不该留失败记号"

@@ -48,3 +48,6 @@ UI方案对比/
 .idea/
 Thumbs.db
 desktop.ini
+# 运行时缓存（首次启动下载的模型 / 自动更新的临时目录）
+模型/
+_update/

@@ -141,9 +141,9 @@ class UpdatePlan:
 
 # ============================================================== 当前安装形态
 def app_dir() -> str:
-    if _FROZEN:
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """程序目录 —— **统一走 paths.app_dir()**（打包后是 exe 所在目录）。"""
+    from ..paths import app_dir as _paths_app_dir
+    return _paths_app_dir()
 
 
 def build_kind() -> str:
@@ -596,17 +596,32 @@ def applier_exe(plan: UpdatePlan) -> str:
     raise FileNotFoundError("解压后的目录里找不到 exe：%s" % root)
 
 
-def spawn_applier(plan: UpdatePlan, old_pid: int = 0) -> subprocess.Popen:
+def spawn_applier(plan: UpdatePlan, old_pid: int = 0, ui: bool = False,
+                  geom: Optional[Tuple[int, int, int, int]] = None) -> subprocess.Popen:
     """启动新版本进程执行覆盖，然后调用方应该马上退出。
 
     `old_pid` 是"当前正在运行的进程"，新进程会等它退出再覆盖文件。
+    `ui=True` 时新版本会**弹一个进度窗口**（"正在合并 → 更新完成"），
+    `geom=(x, y, w, h)` 让那个窗口出现在旧窗口的位置，看起来像同一个窗口在继续。
     """
     exe = applier_exe(plan)
     cfg = os.path.join(plan.staging, "apply.json")
     kwargs = {}
     if os.name == "nt":
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED | NEW_PROCESS_GROUP
+        if ui:
+            # 本进程此刻是前台窗口，有权把"抢焦点"的许可转授给马上要起来的合并进程；
+            # 否则它的小窗会被 Windows 的前台锁按在浏览器后面（用户只会觉得"没反应"）。
+            try:
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)   # ASFW_ANY
+            except Exception:                              # noqa: BLE001
+                pass
     argv = [exe, "--apply-update", cfg, "--old-pid", str(int(old_pid or 0))]
+    if ui:
+        argv.append("--ui")
+        if geom:
+            argv += ["--geom", "%d,%d,%d,%d" % geom]
     return subprocess.Popen(argv, close_fds=True, **kwargs)
 
 
@@ -642,28 +657,47 @@ def wait_for_pid(pid: int, timeout: float = 120.0) -> bool:
     return False
 
 
-def _copy_tree(src: str, dst: str) -> List[str]:
-    """把 src 覆盖拷到 dst（**只覆盖，不删除** dst 里已有的东西）。返回拷贝的文件列表。"""
-    copied = []
+def _copy_tree(src: str, dst: str,
+               progress: Optional[Callable[[int, int], None]] = None) -> List[str]:
+    """把 src 覆盖拷到 dst（**只覆盖，不删除** dst 里已有的东西）。返回拷贝的文件列表。
+
+    `progress(已完成文件数, 总文件数)`：合并进度条用（先数一遍，再逐个拷）。
+    """
+    plan: List[tuple] = []
     for root, _dirs, files in os.walk(src):
         rel = os.path.relpath(root, src)
         target_root = dst if rel == "." else os.path.join(dst, rel)
-        os.makedirs(target_root, exist_ok=True)
         for name in files:
-            s = os.path.join(root, name)
-            t = os.path.join(target_root, name)
-            tmp = t + ".new"
+            plan.append((os.path.join(root, name), target_root, name))
+    total = len(plan)
+    copied: List[str] = []
+    for i, (s, target_root, name) in enumerate(plan):
+        os.makedirs(target_root, exist_ok=True)
+        t = os.path.join(target_root, name)
+        tmp = t + ".new"
+        try:
             shutil.copyfile(s, tmp)
             os.replace(tmp, t)                             # 尽量原子
-            copied.append(t)
+        except Exception:                                  # noqa: BLE001
+            # 单个文件拷不动（被占用/权限）不能连累整体，清掉半成品继续
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        copied.append(t)
+        if progress:
+            progress(i + 1, total)
     return copied
 
 
-def apply_plan(plan: UpdatePlan, old_pid: int = 0, timeout: float = 120.0) -> Dict:
+def apply_plan(plan: UpdatePlan, old_pid: int = 0, timeout: float = 120.0,
+               progress: Optional[Callable[[int, int], None]] = None) -> Dict:
     """真正的覆盖动作（在新版本进程里执行）。返回结果字典，便于 CLI 打印/测试断言。
 
     约定：`error` 表示**更新本身没做成**；`restart_error` 表示"覆盖成功了但没拉起来"
     （这时应该告诉用户"已更新，请手动打开"，而不是当失败）。
+    `progress(已完成文件数, 总文件数)` 给"正在合并"那个窗口用。
     """
     result = {"waited": False, "mode": plan.mode, "copied": [], "restarted": False,
               "error": "", "restart_error": ""}
@@ -675,12 +709,16 @@ def apply_plan(plan: UpdatePlan, old_pid: int = 0, timeout: float = 120.0) -> Di
         if plan.mode == "replace-exe":
             target = plan.target_exe
             os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            if progress:
+                progress(0, 1)
             tmp = target + ".new"
             shutil.copyfile(plan.payload, tmp)
             os.replace(tmp, target)
             result["copied"] = [target]
+            if progress:
+                progress(1, 1)
         else:
-            result["copied"] = _copy_tree(plan.payload, plan.target_dir)
+            result["copied"] = _copy_tree(plan.payload, plan.target_dir, progress)
     except Exception as e:                                 # noqa: BLE001
         result["error"] = "%r" % (e,)
         return result

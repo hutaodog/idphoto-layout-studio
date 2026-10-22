@@ -47,7 +47,7 @@ from ..core.specs import SpecLibrary
 from . import chrome, layouts, style
 from .preview import PreviewCanvas
 from .update_dialog import UpdateDialog
-from .update_worker import UpdateCheckWorker
+from .update_worker import (UpdateCheckWorker, UpdateDownloadWorker)
 from .widgets import (CheckBox, ColorSwatch, NoWheelComboBox, NoWheelDoubleSpinBox,
                       NoWheelSlider, NoWheelSpinBox, PillButton, show_message)
 from .worker import BatchExportWorker, ProcessWorker
@@ -478,25 +478,99 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def _open_update_dialog(self, best, auto: bool = False) -> None:
         dlg = UpdateDialog(best, parent=self, auto_check=auto)
-        dlg.apply_requested.connect(self._apply_update)
+        dlg.start_update.connect(self._start_update)
         dlg.setModal(False)
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
         self._update_dialog = dlg
         dlg.show()
         dlg.raise_()
 
-    def _apply_update(self, plan) -> None:
-        """下载校验都做完了：启动新版本进程去覆盖，然后退出自己。"""
+    # ---------- 更新：主界面让位给独立的更新小窗 ----------
+    def _start_update(self, best) -> None:
+        """用户点了「下载并更新」：**先让主界面退场**，再用一个独立小窗显示下载/合并进度。
+
+        为什么先关主界面：更新最后要覆盖 exe 本体，Windows 不允许覆盖正在运行的程序。
+        主界面先隐藏 → 下载小窗（仍是本进程）→ 下完把活交给"新版本自己的进程"去合并
+        → 本进程退出 → 新进程合并完自己拉起新版本、小窗消失。
+        """
+        from .task_window import TaskWindow
+
+        dlg = getattr(self, "_update_dialog", None)
+        if dlg is not None:
+            dlg.hide()
+        self._prev_visible = self.isVisible()
+        self.hide()                                   # 主界面退场（≒ "把软件本体关了"）
+
+        win = TaskWindow("正在更新到 v%s" % (best.info.version or "新版本"),
+                         "下载完会自动合并并重新打开，你不用管。",
+                         total=updater.pick_asset(best.info).size if
+                         updater.pick_asset(best.info) else 0,
+                         cancellable=True)
+        win.set_badge("更")
+        notes = (best.info.notes or "").strip()
+        if notes:
+            first = [ln.strip("# ").strip() for ln in notes.splitlines() if ln.strip()]
+            win.set_note("本次更新：" + "；".join(first[:3])[:180])
+        win.set_status("正在下载…", indeterminate=True)
+        self._task_win = win
+        win.cancel_requested.connect(lambda: self._cancel_update(win))
+        win.show()
+        win.raise_()
+
+        w = UpdateDownloadWorker(best, None, parent=self)
+        w.progress.connect(lambda d, t: (win.set_status("正在下载…"),
+                                         win.set_progress(d, t)))
+        w.ok.connect(lambda plan: self._update_downloaded(plan, win))
+        w.fail.connect(lambda msg: self._update_failed(msg, win))
+        w.cancelled.connect(lambda: self._cancel_update(win))
+        self._update_downloader = w
+        w.start()
+
+    def _update_downloaded(self, plan, win) -> None:
+        """下载 + 校验 + 解压都好了 → 交给新版本进程去做合并（带它自己的窗口）。"""
+        geom = "%d,%d,%d,%d" % (win.x(), win.y(), win.width(), win.height())
         try:
-            updater.spawn_applier(plan, old_pid=os.getpid())
+            updater.spawn_applier(plan, old_pid=os.getpid(), ui=True, geom=geom)
         except Exception as e:                            # noqa: BLE001
-            show_message(self, "更新启动失败",
-                         "新版本已经下载好了，但没能把它启动起来。\n"
-                         "可以稍后再试，或者去 Release 页面手动下载。",
-                         kind="error", detail="%r\n%s" % (e, plan.staging))
+            win.set_error("没法启动合并进程", "%r\n%s" % (e, plan.staging))
+            win.btn_ok.clicked.connect(lambda: self._restore_after_failed_update(win))
             return
-        self.status.showMessage("正在重启并更新到 v%s …" % (plan.version or ""))
-        QTimer.singleShot(250, self.close)
+        win.set_status("下载完成，正在合并文件…", indeterminate=True)
+        # 主界面和下载小窗一起退场；合并窗口会在同一位置出现
+        QTimer.singleShot(120, win.close)
+        QTimer.singleShot(220, self._quit_app)
+
+    def _quit_app(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _update_failed(self, msg: str, win) -> None:
+        win.set_error("下载失败（可以点「取消」回到程序）", str(msg)[:400])
+        win.btn_cancel.setText("回到程序")
+        win.btn_cancel.setEnabled(True)
+
+    def _cancel_update(self, win) -> None:
+        w = getattr(self, "_update_downloader", None)
+        if w is not None and w.isRunning():
+            w.cancel()
+            return
+        self._restore_after_failed_update(win)
+
+    def _restore_after_failed_update(self, win) -> None:
+        """更新没做成：把主界面恢复回来，别让用户以为程序没了。"""
+        try:
+            win.close()
+        except Exception:                                # noqa: BLE001
+            pass
+        dlg = getattr(self, "_update_dialog", None)
+        if dlg is not None and not dlg.isVisible():
+            dlg.deleteLater()
+        self._update_dialog = None
+        self.show()
+        self.raise_()
+        self.status.showMessage("已取消更新，还是原来的 v%s" % __version__)
 
     def _build_toolbar(self) -> QToolBar:
         tb = QToolBar("主工具栏")

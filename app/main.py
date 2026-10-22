@@ -241,60 +241,197 @@ def selftest(out_dir: str, image: str = "") -> int:
     return 0 if report["ok"] else 1
 
 
-def run_apply_update(cfg: str, old_pid: int = 0) -> int:
-    """`--apply-update <apply.json> --old-pid <pid>`：**无界面**地把新版本覆盖上去。
+def run_apply_update(cfg: str, old_pid: int = 0, ui: bool = False,
+                     geom: str = "") -> int:
+    """`--apply-update <apply.json> --old-pid <pid> [--ui] [--geom x,y,w,h]`。
 
-    这个进程就是"更新包里的新版本"，由旧版本用 `updater.spawn_applier()` 拉起。
-    它要做的三件事：等旧进程退出 → 覆盖文件 → 重新启动程序。
+    **无界面**地被旧版本用 `updater.spawn_applier()` 拉起，做三件事：
+    等旧进程退出 → 覆盖文件 → 重新启动程序。
 
-    因为是无界面运行（没有控制台），结果写进程序目录的 `.logs/更新日志.txt`；
-    万一覆盖失败，会把旧版本再拉起来，别把用户晾在"什么都没有"的状态。
+    `--ui` 时（v1.6.3 起）**弹一个进度窗口**：用户点完"更新"主界面就关了，
+    这一窗接着显示「正在合并文件 → 更新完成」，然后自动拉起新版本、窗口自己消失。
+    窗口位置可以用 `--geom` 继承上一窗的位置，看起来是同一个窗口在继续。
+
+    结果写进 `<程序目录>/.logs/更新日志.txt`；万一覆盖失败，会把旧版本再拉起来，
+    别把用户晾在"什么都没有"的状态。
     """
     import json
 
     from app.core import updater
 
-    lines = []
-    ok = False
+    lines: list = []
+    result: dict = {}
+    plan = None
+
     try:
-        with open(cfg, "r", encoding="utf-8") as f:
+        # utf-8-sig：有人（或某个编辑器/剪贴板）在 apply.json 前面加了个 BOM 也要能读。
+        # 实测踩过：PowerShell 的 Set-Content -Encoding UTF8 会写 BOM，json.load 直接报
+        # "Unexpected UTF-8 BOM"，更新就静默失败成 exit=1。
+        with open(cfg, "r", encoding="utf-8-sig") as f:
             plan = updater.UpdatePlan.from_dict(json.load(f))
-        res = updater.apply_plan(plan, old_pid=old_pid)
-        ok = not res["error"]
-        lines.append("plan     : %s" % json.dumps(plan.to_dict(), ensure_ascii=False))
-        lines.append("waited   : %s" % res["waited"])
-        lines.append("copied   : %d 个文件" % len(res["copied"]))
-        lines.append("restarted: %s" % res["restarted"])
-        if res["error"]:
-            lines.append("error    : %s" % res["error"])
-        if res.get("restart_error"):
-            lines.append("restart_error: %s" % res["restart_error"])
-        if not ok:
-            # 覆盖失败：把原来的程序拉起来（至少还能用旧版）
-            try:
-                import subprocess
-                subprocess.Popen([plan.target_exe], cwd=plan.target_dir, close_fds=True)
-                lines.append("已回退启动旧版本")
-            except Exception as e:                        # noqa: BLE001
-                lines.append("回退启动失败: %r" % (e,))
     except Exception as e:                                # noqa: BLE001
-        lines.append("未预期的错误: %r" % (e,))
-    # 日志必须写到**被更新的那个程序目录**里：本进程是从 _update/ 里跑起来的，
-    # 那个目录落地后会被删掉，写在自己旁边等于白写。
-    try:
-        target = ""
+        lines.append("读不到更新计划: %r" % (e,))
+        _write_update_log(plan, lines, False)
+        return 1
+
+    if not ui:
+        # 无窗口的老路子（老版本调新版本、或用户在命令行里手动跑）
         try:
-            target = plan.target_dir               # noqa: F821 (上面的 plan 可能没绑定)
-        except Exception:                          # noqa: BLE001
+            result.update(updater.apply_plan(plan, old_pid=old_pid))
+        except Exception as e:                            # noqa: BLE001
+            result["error"] = "%r" % (e,)
+        ok = not result.get("error")
+        lines += _result_lines(plan, result)
+        if not ok:
+            _relaunch_old(plan, lines)
+        _write_update_log(plan, lines, ok)
+        return 0 if ok else 1
+
+    # ---------------- 带界面的合并 ----------------
+    from PySide6.QtCore import QThread, QTimer, Signal
+    from PySide6.QtWidgets import QApplication
+
+    from app.ui.task_window import TaskWindow
+
+    qapp = QApplication.instance() or QApplication(sys.argv)
+    try:                                                   # 图标 + 中文字体
+        from app.ui.chrome import app_icon
+        icon = app_icon()
+        if not icon.isNull():
+            qapp.setWindowIcon(icon)
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        apply_chinese_font(qapp)
+    except Exception:                                     # noqa: BLE001
+        pass
+
+    win = TaskWindow("正在更新到 v%s" % (plan.version or "新版本"),
+                     "正在合并文件，请不要关闭这个窗口（几十秒就好）。")
+    win.set_badge("更")
+    win.set_status("等待旧版本退出…", indeterminate=True)
+    win.set_stats_text("")
+    if geom:
+        try:
+            x, y = [int(v) for v in geom.split(",")[:2]]
+            win.move_to(x, y)
+        except Exception:                                 # noqa: BLE001
+            pass
+    win.bring_to_front()                      # 后台进程拉起的窗口要强制提到最前
+
+    class Merger(QThread):
+        progress = Signal(int, int)
+        done = Signal()
+
+        def run(self):
+            try:
+                res = updater.apply_plan(
+                    plan, old_pid=old_pid,
+                    progress=lambda d, t: self.progress.emit(int(d), int(t)))
+                result.update(res)
+            except Exception as e:                        # noqa: BLE001
+                result["error"] = "%r" % (e,)
+            self.done.emit()
+
+    merger = Merger()
+    merger.progress.connect(lambda d, t: (win.set_status("正在合并文件…"),
+                                          win.set_progress(d, t, with_speed=False),
+                                          win.set_stats_text("%d / %d 个文件" % (d, t))))
+
+    def finish():
+        ok2 = not result.get("error")
+        result["ok"] = ok2
+        if ok2:
+            # 先把新版本拉起来，再让这一窗自己消失
+            launch_err = ""
+            try:
+                _launch_target(plan)
+                result["restarted"] = True
+            except Exception as e:                        # noqa: BLE001
+                launch_err = "%r" % (e,)
+                lines.append("启动失败: %r" % (e,))
+            lines.extend(_result_lines(plan, result))
+            _write_update_log(plan, lines, True)
+            if launch_err:
+                # 合并成功但没拉起来：别谎称"正在打开"，让用户自己点
+                win.set_success("已更新完成，但没能自动打开",
+                                "请手动双击程序")
+                win.lbl_status.setStyleSheet(
+                    "color:%s;font-size:12px;font-weight:600;" % style_warn())
+                QTimer.singleShot(6000, win.close)
+                QTimer.singleShot(6200, qapp.quit)
+            else:
+                win.set_success("更新完成！正在打开新版本…",
+                                "v%s" % (plan.version or ""))
+                QTimer.singleShot(1100, win.close)
+                QTimer.singleShot(1300, qapp.quit)
+        else:
+            lines.extend(_result_lines(plan, result))
+            _relaunch_old(plan, lines)
+            _write_update_log(plan, lines, False)
+            win.set_error("更新失败，已回到原来的版本",
+                          str(result.get("error") or "")[:400])
+            win.btn_ok.clicked.connect(qapp.quit)
+            QTimer.singleShot(6000, qapp.quit)
+
+    merger.done.connect(finish)
+    merger.start()
+    qapp.exec()
+    return 0 if result.get("ok") else 1
+
+
+
+def style_warn() -> str:
+    """警示色（跟界面样式表同一个来源，别在代码里硬写色值）。"""
+    try:
+        from app.ui import style
+        return style.WARN
+    except Exception:                                     # noqa: BLE001
+        return "#c8860a"
+
+
+def _result_lines(plan, result: dict) -> list:
+    import json
+
+    return [
+        "plan     : %s" % json.dumps(plan.to_dict() if plan else {}, ensure_ascii=False),
+        "waited   : %s" % result.get("waited"),
+        "copied   : %d 个文件" % len(result.get("copied") or []),
+        "restarted: %s" % result.get("restarted"),
+        "error    : %s" % (result.get("error") or "（无）"),
+        "restart_error: %s" % (result.get("restart_error") or "（无）"),
+    ]
+
+
+def _launch_target(plan) -> None:
+    import subprocess
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000008
+    subprocess.Popen([plan.target_exe], cwd=plan.target_dir, close_fds=True, **kwargs)
+
+
+def _relaunch_old(plan, lines: list) -> None:
+    try:
+        _launch_target(plan)
+        lines.append("已回退启动旧版本")
+    except Exception as e:                                # noqa: BLE001
+        lines.append("回退启动失败: %r" % (e,))
+
+
+def _write_update_log(plan, lines: list, ok: bool) -> None:
+    """日志写到**被更新的那个程序目录**里（applier 自己所在的 _update 会被删掉）。"""
+    try:
+        target = plan.target_dir if plan is not None else ""
+        if not target:
             from app.paths import app_dir as _app_dir
             target = _app_dir()
-        log_dir = os.path.join(target, ".logs")
-        os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "更新日志.txt"), "a", encoding="utf-8") as f:
+        d = os.path.join(target, ".logs")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "更新日志.txt"), "a", encoding="utf-8") as f:
             f.write("\n=== %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
             f.write("\n".join(lines) + "\n")
-        # 更新失败要留个记号：用户只会看到"程序又开成旧版本了"，得告诉他为什么
-        note = os.path.join(log_dir, "更新失败.txt")
+        note = os.path.join(d, "更新失败.txt")
         if ok:
             try:
                 os.remove(note)
@@ -305,7 +442,104 @@ def run_apply_update(cfg: str, old_pid: int = 0) -> int:
                 f.write("\n".join(lines) + "\n")
     except Exception:                                     # noqa: BLE001
         pass
-    return 0 if ok else 1
+
+
+def _dbg(msg: str) -> None:
+    """引导流程的调试输出（`IDPHOTO_DEBUG=1` 才打，正式运行不刷屏）。"""
+    if os.environ.get("IDPHOTO_DEBUG", "").strip().lower() in ("1", "on", "true"):
+        print("[boot] %s" % msg, flush=True)
+
+
+def run_weights_bootstrap(qapp) -> bool:
+    """首次启动：模型不在就先弹一个下载小窗，下完自动继续。
+
+    便携版/安装版都**不带 25MB 的模型**，普通用户第一次双击时只能靠这里。
+    返回 True = 模型可用（或用户自己已经放好了）。
+    """
+    from app.core import weights as wcore
+    from app.ui.task_window import TaskWindow
+    from PySide6.QtCore import QThread, Signal, QTimer
+
+    if wcore.in_place():
+        return True
+    if wcore.cached() and wcore.ensure_placed():        # 上次下过，只是单文件版又要重放一遍
+        return True
+
+    win = TaskWindow("第一次启动，需要下载模型",
+                     "抠图模型约 %.0f MB，只需下载一次，下完会自动打开程序。"
+                     % (wcore.MODEL_SIZE / 1048576.0),
+                     total=wcore.MODEL_SIZE, cancellable=True)
+    win.set_badge("模")
+    win.set_status("正在下载模型…", indeterminate=True)
+
+    state = {"ok": False}
+
+    class Worker(QThread):
+        progress = Signal(int, int)
+        done_ok = Signal()
+        fail = Signal(str)
+        cancelled = Signal()
+
+        def __init__(self):
+            super().__init__()
+            self._stop = False
+
+        def stop(self):
+            self._stop = True
+
+        def run(self):
+            try:
+                wcore.download(progress=lambda d, t: self.progress.emit(int(d), int(t)),
+                               should_stop=lambda: self._stop)
+                self.done_ok.emit()
+            except wcore.WeightsCancelled:
+                self.cancelled.emit()
+            except Exception as e:                      # noqa: BLE001
+                self.fail.emit(str(e) or repr(e))
+
+    worker = Worker()
+    worker.progress.connect(lambda d, t: (win.set_status("正在下载模型…"),
+                                          win.set_progress(d, t)))
+
+    # 用**局部 QEventLoop** 等这一窗结束。
+    # 千万不要在这里 qapp.exec() / qapp.quit()：quit() 的"退出请求"会被 main() 里
+    # 后面那次 qapp.exec() 立刻吃掉，结果是主窗口还没建、进程就退出了
+    # （实测：exit=0、模型下好了、一个窗口都没出现在屏幕上）。
+    from PySide6.QtCore import QEventLoop
+    loop = QEventLoop()
+
+    def on_ok():
+        state["ok"] = True
+        win.set_success("模型下载完成，正在打开程序…")
+        QTimer.singleShot(700, win.close)
+        QTimer.singleShot(900, loop.quit)
+
+    def on_fail(msg):
+        # 失败时窗口留着，让用户看清原因再点「关闭」退出（别静默消失）
+        win.set_error("模型下载失败（点「关闭」退出，重新打开会再试一次）", msg)
+        win.btn_ok.clicked.connect(loop.quit)
+
+    def on_cancel():
+        win.set_note("没有模型就没法抠图。重新打开程序会再试一次；"
+                     "也可以手动下载后放到：\n%s" % wcore.cache_path())
+        win.set_error("已取消下载")
+        win.btn_ok.clicked.connect(loop.quit)
+        QTimer.singleShot(1500, win.close)
+        QTimer.singleShot(1700, loop.quit)
+
+    worker.done_ok.connect(on_ok)
+    worker.fail.connect(on_fail)
+    worker.cancelled.connect(on_cancel)
+    win.cancel_requested.connect(worker.stop)
+    win.bring_to_front()
+    _dbg("bootstrap window shown (visible=%s, size=%s)" % (win.isVisible(), win.size()))
+    worker.start()
+    loop.exec()
+    _dbg("bootstrap finished, ok=%s" % state["ok"])
+    if worker.isRunning():                                # 别把线程留在运行状态就往下走
+        worker.stop()
+        worker.wait(3000)
+    return bool(state["ok"])
 
 
 def main() -> int:
@@ -323,7 +557,12 @@ def main() -> int:
                 pid = int(argv[j + 1])
             except (IndexError, ValueError):
                 pid = 0
-        return run_apply_update(cfg, pid)
+        geom = ""
+        if "--geom" in argv:
+            j = argv.index("--geom")
+            if len(argv) > j + 1:
+                geom = argv[j + 1]
+        return run_apply_update(cfg, pid, ui=("--ui" in argv), geom=geom)
     if "--selftest" in argv:
         i = argv.index("--selftest")
         if len(argv) > i + 1 and not argv[i + 1].startswith("-"):
@@ -374,6 +613,19 @@ def main() -> int:
         close_splash()
         QMessageBox.critical(None, APP_NAME, "规格库加载失败：%s" % e)
         return 2
+
+    # 首次启动：模型不在就先弹下载小窗（便携版/安装版都不带那 25MB），下完才进主界面。
+    # 这里放在主窗口之前，用户看到的顺序才是"双击 → 小框下载 → 程序打开"。
+    try:
+        if not Processor.weights_ready():
+            ok = run_weights_bootstrap(qapp)
+            if not ok:
+                close_splash()
+                return 3                                  # 用户取消/下载失败：不打开主界面
+    except Exception as e:                                # noqa: BLE001
+        print("[weights] 引导失败: %r" % (e,))
+    finally:
+        close_splash()
 
     try:
         win = MainWindow(lib)

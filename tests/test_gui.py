@@ -886,6 +886,157 @@ def test_update_dialog_shows_source_and_latency(qapp, monkeypatch, tmp_path):
         dlg.close()
 
 
+def test_task_window_states_and_text(qapp):
+    """独立的进度小窗：进度/速度文案、完成态换按钮、运行中不许关窗。"""
+    from app.core import weights as wcore
+    from app.ui.task_window import TaskWindow
+
+    win = TaskWindow("正在下载模型", "约 24.7 MB", total=wcore.MODEL_SIZE,
+                     cancellable=True)
+    try:
+        win.set_status("正在下载模型…")
+        win.set_progress(wcore.MODEL_SIZE // 2, wcore.MODEL_SIZE)
+        assert "12.3" in win.lbl_stats.text() or "MB" in win.lbl_stats.text()
+        assert "/" in win.lbl_stats.text()
+        assert abs(win.bar._value - 0.5) < 0.02, win.bar._value
+        assert win.btn_cancel.isVisible() or not win.isVisible()
+
+        # 运行中直接关窗没意义：必须被忽略
+        win.show()
+        win.close()
+        assert win.isVisible(), "下载中不该允许直接关掉"
+
+        # 完成态：取消消失、关闭出现、进度满、角标换成画的对勾
+        win.set_success("更新完成！正在打开新版本…", "v9.9.9")
+        assert win.btn_ok.isVisible() and not win.btn_cancel.isVisible()
+        assert win.bar._value == 1.0
+        assert win.badge.pixmap() is not None and not win.badge.pixmap().isNull()
+        assert "更新完成" in win.lbl_status.text()
+        win.close()
+        assert not win.isVisible(), "完成后应该能关掉"
+    finally:
+        win.close()
+
+    # 错误态：红字 + 详情框 + 关窗可关
+    bad = TaskWindow("正在下载模型", total=100, cancellable=True)
+    try:
+        bad.show()
+        qapp.processEvents()
+        bad.set_error("下载失败", "https://example.invalid -> timeout")
+        qapp.processEvents()
+        assert bad._finished
+        assert bad.lbl_note.isVisible() and "timeout" in bad.lbl_note.text()
+        assert bad.btn_ok.isVisible() and not bad.btn_cancel.isVisible()
+        bad.close()
+        assert not bad.isVisible()
+    finally:
+        bad._finished = True
+        bad.close()
+
+
+def test_cancel_signal_from_task_window(qapp):
+    from app.ui.task_window import TaskWindow
+
+    win = TaskWindow("正在下载", total=100, cancellable=True)
+    seen = []
+    win.cancel_requested.connect(lambda: seen.append(True))
+    try:
+        win.btn_cancel.click()
+        assert seen == [True]
+        assert "取消" in win.lbl_status.text()
+    finally:
+        win.close()
+
+
+def test_start_update_closes_main_window_and_shows_task_window(win, qapp, monkeypatch):
+    """点「下载并更新」后：主界面退场 + 独立的更新小窗出现（用户要求的那套流程）。"""
+    import app.ui.main_window as mw
+    from app.core import updater
+
+    class FakeWorker(qapp.__class__ and object):        # 不真的联网
+        def __init__(self, *a, **k):
+            from PySide6.QtCore import QObject, Signal
+
+            class _S(QObject):
+                progress = Signal(int, int)
+                ok = Signal(object)
+                fail = Signal(str)
+                cancelled = Signal()
+
+            self._s = _S()
+            for name in ("progress", "ok", "fail", "cancelled"):
+                setattr(self, name, getattr(self._s, name))
+
+        def start(self):
+            self.started = True
+
+        def isRunning(self):
+            return False
+
+        def cancel(self):
+            self.cancelled_flag = True
+
+    monkeypatch.setattr(mw, "UpdateDownloadWorker", FakeWorker)
+    info = updater.ReleaseInfo(version="9.9.9", assets=[
+        updater.Asset("x-v9.9.9-portable.zip", "u", 1048576)])
+    best = updater.BestRelease(info=info,
+                               source=updater.Source("节点", "manifest", "http://x/u.json"),
+                               latency_ms=10.0, candidates=[])
+    win.show()
+    try:
+        win._start_update(best)
+        assert not win.isVisible(), "主界面应该先退场"
+        task = getattr(win, "_task_win", None)
+        assert task is not None and task.isVisible()
+        assert "9.9.9" in task.lbl_title.text()
+
+        # 下载完成后：必须用 --ui 交给新版本进程去合并，并带上窗口位置
+        calls = {}
+        monkeypatch.setattr(updater, "spawn_applier",
+                            lambda plan, old_pid=0, ui=False, geom=None:
+                            calls.update(dict(plan=plan, old_pid=old_pid, ui=ui,
+                                              geom=geom)))
+        plan = updater.UpdatePlan(mode="extract-copy", staging="s", target_dir="t",
+                                  target_exe="e", payload="p", version="9.9.9")
+        win._update_downloaded(plan, task)
+        assert calls["ui"] is True, "合并阶段必须带界面"
+        assert calls["old_pid"] == __import__("os").getpid()
+        assert calls["geom"] and len(calls["geom"].split(",")) == 4
+        task._finished = True
+        task.close()
+    finally:
+        win.show()
+
+
+def test_failed_update_restores_main_window(win, qapp):
+    """更新没成功就把主界面放回来，别让用户以为程序没了。"""
+    from app.ui.task_window import TaskWindow
+
+    task = TaskWindow("正在更新", total=100, cancellable=True)
+    task.show()
+    win.hide()
+    try:
+        win._restore_after_failed_update(task)
+        assert win.isVisible(), "取消/失败后主界面必须回来"
+    finally:
+        task._finished = True
+        task.close()
+
+
+def test_weights_bootstrap_skips_when_model_present(qapp, monkeypatch):
+    """模型已经就位时，首次启动引导**不能**再弹窗（否则每次启动都弹）。"""
+    from app.core import weights as wcore
+    import app.main as app_main
+
+    monkeypatch.setattr(wcore, "in_place", lambda: True)
+    assert app_main.run_weights_bootstrap(qapp) is True
+
+    monkeypatch.setattr(wcore, "in_place", lambda: False)
+    monkeypatch.setattr(wcore, "cached", lambda: True)
+    monkeypatch.setattr(wcore, "ensure_placed", lambda: True)
+    assert app_main.run_weights_bootstrap(qapp) is True, "缓存里有就直接拷贝，不弹窗"
+
+
 def test_window_edges_are_not_resize_zones(win, qapp):
     """窗口**不能**拖边缘改大小（用户 v1.5.6："改成窗口默认不可随意拉拽调整窗口大小"）。
 

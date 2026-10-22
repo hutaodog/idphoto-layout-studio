@@ -25,10 +25,11 @@ from .update_worker import UpdateDownloadWorker, describe_sources
 class UpdateDialog(QDialog):
     """检查更新 / 下载更新 的窗口。
 
-    `apply_requested(plan)` 信号发出后，主窗口负责启动新版本进程并退出自己。
+    `start_update(best)` 信号发出后，主窗口负责收起主界面、开独立的更新进度小窗。
     """
 
-    apply_requested = Signal(object)      # UpdatePlan
+    start_update = Signal(object)         # BestRelease → 独立更新小窗
+    apply_requested = Signal(object)      # UpdatePlan（旧流程，保留兼容）
     skipped = Signal(str)                 # 版本号
 
     def __init__(self, best, parent=None,
@@ -183,26 +184,18 @@ class UpdateDialog(QDialog):
         self.reject()
 
     def _on_go(self) -> None:
+        """点「下载并更新」→ 交给主窗口开一个**独立的更新小窗**（v1.6.3 的流程）。
+
+        对话框自己不再下载：主窗口会把主界面收起来、弹出下载/合并进度窗，
+        这样用户看到的是"软件本体关了 → 一个小窗在下载合并"。
+        """
         if self.asset is None:
             self._open_page()
             return
-        if self._worker is not None and self._worker.isRunning():
-            return
         self.btn_go.setEnabled(False)
-        self.btn_later.setEnabled(False)
-        self.btn_skip.setEnabled(False)
-        self.bar.setVisible(True)
-        self.lbl_progress.setVisible(True)
-        self.lbl_progress.setText("正在下载…")
-        self.btn_go.setText("正在下载…")
-
-        w = UpdateDownloadWorker(self.best, self.kind, parent=self)
-        w.progress.connect(self._on_progress)
-        w.ok.connect(self._on_downloaded)
-        w.fail.connect(self._on_failed)
-        w.cancelled.connect(self._on_cancelled)
-        self._worker = w
-        w.start()
+        self.btn_go.setText("正在启动更新…")
+        self.start_update.emit(self.best)
+        self.close()
 
     def cancel_download(self) -> None:
         if self._worker is not None and self._worker.isRunning():
