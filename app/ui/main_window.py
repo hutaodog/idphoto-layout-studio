@@ -55,6 +55,13 @@ from .worker import BatchExportWorker, ProcessWorker
 IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff);;所有文件 (*.*)"
 APP_TITLE = "证件照排版助手"
 
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+
+
+def _is_image_path(path: str) -> bool:
+    """拖进来的文件是不是图片（拖拽只看后缀，够用了）。"""
+    return os.path.splitext(path or "")[1].lower() in IMAGE_EXTS
+
 
 def default_out_dir() -> str:
     """默认输出目录：**程序目录下的「输出」**（不可写才退回「图片\\证件照输出」）。
@@ -103,6 +110,10 @@ class MainWindow(QMainWindow):
         self._out_dir = self._saved_out_dir() or default_out_dir()
         self.layout_id = layouts.DEFAULT_LAYOUT
         self._layout_actions: Dict[str, QAction] = {}
+        # 整窗都接拖进来的图片：只在预览卡片上放 DropArea 时，用户把文件放到
+        # 左边参数区/工具栏上就"没反应"（第二张图经常就是这么丢的）。
+        self.setAcceptDrops(True)
+        self._drop_hot = False
         # 追加一段"毛玻璃模式"的覆盖样式：
         # 窗口自己不能再刷底色（否则 DWM 的模糊被盖住），提示框也要半透明。
         self.setStyleSheet(style.STYLESHEET + """
@@ -1162,25 +1173,76 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         if paths:
             self.add_photos(paths[:1])
 
+    # ---------- 拖进来导入（整窗有效，不只是预览区）----------
+    def dragEnterEvent(self, e):                           # noqa: N802
+        md = e.mimeData()
+        if md.hasUrls() and any(_is_image_path(u.toLocalFile()) for u in md.urls()):
+            e.acceptProposedAction()
+            self._drop_hot = True
+            self.status.showMessage("松手就导入这张照片")
+            return
+        super().dragEnterEvent(e)
+
+    def dragLeaveEvent(self, e):                           # noqa: N802
+        self._drop_hot = False
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):                                # noqa: N802
+        self._drop_hot = False
+        paths = [u.toLocalFile() for u in e.mimeData().urls()
+                 if _is_image_path(u.toLocalFile())]
+        if paths:
+            e.acceptProposedAction()
+            self.add_photos(paths)
+            return
+        super().dropEvent(e)
+
     def on_import_many(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "批量选择照片", "", IMAGE_FILTER)
         if paths:
             self.add_photos(paths)
 
     def add_photos(self, paths: List[str]) -> None:
-        added = False
-        for p in paths:
-            if any(it.path == p for it in self.items):
+        """导入照片：**新加进来的那张自动选中并开始处理**。
+
+        这里踩过一个真 bug（用户："导入一张照片后，再换一张拖进去就不好使了"）：
+        以前加完只做 `setCurrentRow(0)` / 重选当前行，第二张虽然进了列表，
+        **预览却还停在第一张** —— 用户看到的就是"拖进去没反应"。
+        现在明确选中最后新加的那张；如果拖进来的全是已经有的，就选中它并说明，别静默无反应。
+        """
+        new_rows: List[int] = []
+        for raw in paths:
+            # 路径统一成规范形式再比：拖放给的是 `C:/x/a.jpg`，文件对话框给的是
+            # `C:\x\a.jpg`，不归一化就会把同一张照片当成两张（"重复导入"的另一半原因）。
+            p = os.path.normpath(str(raw))
+            if any(os.path.normpath(it.path) == p for it in self.items):
                 continue
             self.items.append(PhotoItem(path=p))
-            it = QListWidgetItem(os.path.basename(p), self.lst_photos)
-            it.setToolTip(p)          # 名字被省略号截断时看这里
-            added = True
+            item = QListWidgetItem(os.path.basename(p), self.lst_photos)
+            item.setToolTip(p)            # 名字被省略号截断时看这里
+            new_rows.append(len(self.items) - 1)
         self._update_batch_label()
-        if self.lst_photos.currentRow() < 0 and self.lst_photos.count():
-            self.lst_photos.setCurrentRow(0)
-        elif added:
-            self.on_photo_selected(self.lst_photos.currentRow())
+
+        if new_rows:
+            row = new_rows[-1]
+            self.lst_photos.blockSignals(True)
+            self.lst_photos.setCurrentRow(row)
+            self.lst_photos.blockSignals(False)
+            self.on_photo_selected(row)
+            more = "（另有 %d 张已加进列表）" % (len(new_rows) - 1) if len(new_rows) > 1 else ""
+            self.status.showMessage("已导入 %s%s" % (os.path.basename(self.items[row].path),
+                                                    more))
+        elif paths:
+            p = paths[-1]
+            for i, it in enumerate(self.items):
+                if it.path == p:
+                    self.lst_photos.blockSignals(True)
+                    self.lst_photos.setCurrentRow(i)
+                    self.lst_photos.blockSignals(False)
+                    self.on_photo_selected(i)
+                    break
+            self.status.showMessage("这张已经在列表里了：%s" % os.path.basename(p))
+        self._refresh_card_summaries()
 
     def _update_batch_label(self) -> None:
         if getattr(self, "lbl_batch", None) is not None:

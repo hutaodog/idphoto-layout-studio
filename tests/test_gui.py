@@ -1037,6 +1037,112 @@ def test_weights_bootstrap_skips_when_model_present(qapp, monkeypatch):
     assert app_main.run_weights_bootstrap(qapp) is True, "缓存里有就直接拷贝，不弹窗"
 
 
+def _drop_files(widget, paths):
+    """给某个控件直接发一次"文件拖放"。（offscreen 下没真拖拽，直接调 dropEvent）"""
+    from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDropEvent
+
+    md = QMimeData()
+    md.setUrls([QUrl.fromLocalFile(p) for p in paths])
+    ev = QDropEvent(QPointF(8, 8), Qt.CopyAction, md, Qt.LeftButton, Qt.NoModifier)
+    widget.dropEvent(ev)
+
+
+def _row_of(win, path):
+    for i, it in enumerate(win.items):
+        if it.path == path:
+            return i
+    return -1
+
+
+def test_second_drop_switches_preview_to_the_new_photo(win, qapp, tmp_path):
+    """用户反馈的 bug：导入一张之后，再拖另一张进去"就不好使了"。
+
+    根因：`add_photos()` 加完只 `setCurrentRow(0)` / 重选当前行 —— 第二张确实进了列表，
+    但**预览还停在第一张**，看起来就像拖进去没反应。现在必须选中"刚加进来的那张"。
+    """
+    import shutil
+
+    from conftest import DEMO_IMAGE
+    from app.ui.layouts.studio import DropArea
+
+    a = os.path.normpath(str(tmp_path / "a.jpg"))
+    b = os.path.normpath(str(tmp_path / "b.jpg"))
+    shutil.copyfile(DEMO_IMAGE, a)
+    shutil.copyfile(DEMO_IMAGE, b)
+
+    card = win.findChild(DropArea)
+    assert card is not None, "预览区里没有能接拖放的 DropArea"
+
+    n0 = len(win.items)
+    _drop_files(card, [a])
+    qapp.processEvents()
+    assert len(win.items) == n0 + 1
+    assert win.current.path == a
+
+    _drop_files(card, [b])
+    qapp.processEvents()
+    assert len(win.items) == n0 + 2, "第二张没进列表"
+    assert win.current.path == b, "预览没切到第二张 —— 用户看到的就是'拖进去没反应'"
+    assert win.lst_photos.currentRow() == _row_of(win, b)   # 列表选中项也要跟着走
+    win._worker and win._worker.wait(5000)       # 别把线程留在半路
+
+
+def test_drop_on_whole_window_imports(win, qapp, tmp_path):
+    """拖到**窗口任意位置**都能导入，不只是预览区（用户常常顺手往左栏丢）。"""
+    import shutil
+
+    from conftest import DEMO_IMAGE
+
+    c = os.path.normpath(str(tmp_path / "c.jpg"))
+    shutil.copyfile(DEMO_IMAGE, c)
+    n0 = len(win.items)
+    _drop_files(win, [c])
+    qapp.processEvents()
+    assert len(win.items) == n0 + 1
+    assert win.current.path == c
+    assert win.acceptDrops(), "主窗口必须开拖放"
+    win._worker and win._worker.wait(5000)
+
+
+def test_dropping_existing_photo_does_not_duplicate(win, qapp, tmp_path):
+    """重复拖同一张：不重复加，但要选中它并给一句提示（不能静默无反应）。"""
+    import shutil
+
+    from conftest import DEMO_IMAGE
+
+    d = os.path.normpath(str(tmp_path / "d.jpg"))
+    shutil.copyfile(DEMO_IMAGE, d)
+    win.add_photos([d])
+    qapp.processEvents()
+    n = len(win.items)
+    win.add_photos([d])
+    qapp.processEvents()
+    assert len(win.items) == n, "同一张照片不该重复进列表"
+    assert win.current.path == d
+    assert "已经在列表里" in win.status.currentMessage()
+    win._worker and win._worker.wait(5000)
+
+
+def test_import_switches_to_the_newest_of_several(win, qapp, tmp_path):
+    """一次拖进来好几张：选最后一张（用户刚看的就是它）。"""
+    import shutil
+
+    from conftest import DEMO_IMAGE
+
+    paths = []
+    for name in ("e1.jpg", "e2.jpg"):
+        p = os.path.normpath(str(tmp_path / name))
+        shutil.copyfile(DEMO_IMAGE, p)
+        paths.append(p)
+    n0 = len(win.items)
+    win.add_photos(paths)
+    qapp.processEvents()
+    assert len(win.items) == n0 + 2
+    assert win.current.path == paths[-1]
+    win._worker and win._worker.wait(5000)
+
+
 def test_window_edges_are_not_resize_zones(win, qapp):
     """窗口**不能**拖边缘改大小（用户 v1.5.6："改成窗口默认不可随意拉拽调整窗口大小"）。
 
