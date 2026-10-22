@@ -286,9 +286,12 @@ def test_default_sources_includes_custom_urls(monkeypatch, tmp_path):
     import app.core.settings as st
     monkeypatch.setattr(st, "settings_path", lambda: str(tmp_path / "settings.json"))
     srcs = up.default_sources(["http://host/update/update.json"])
-    assert srcs[0].name == "GitHub"
-    assert len(srcs) == 2 and srcs[1].kind == "manifest"
-    assert srcs[1].url == "http://host/update/update.json"
+    names = [s.name for s in srcs]
+    assert names[0] == "GitHub"
+    # GitHub 的 API 未登录会限流，所以固定再带一个镜像源
+    assert "GitHub 镜像" in names
+    custom = [s for s in srcs if s.kind == "manifest"]
+    assert len(custom) == 1 and custom[0].url == "http://host/update/update.json"
 
 
 def test_prepare_update_best_falls_back_to_next_source(tmp_path, monkeypatch):

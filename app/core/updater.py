@@ -322,8 +322,17 @@ class BestRelease:
 
 
 def default_sources(extra: Optional[Sequence[str]] = None) -> List[Source]:
-    """GitHub + 设置里的自定义静态源（`update_sources` 里的 URL）。"""
+    """GitHub + GitHub 镜像 + 设置里的自定义静态源（`update_sources` 里的 URL）。
+
+    **为什么要带一个 GitHub 镜像源**：GitHub 的 API 未登录时限流 60 次/小时/IP，
+    超了直接 403 —— 实测在家用网络里连续检查几次就会撞上。gh-proxy 能正常代理这个 API
+    （实测 1.5s 左右拿到 tag），所以把它也当成一个"源"一起测速，直连被限流时还有得用。
+    """
     sources = [Source("GitHub", "github", API_LATEST)]
+    try:
+        sources.append(Source("GitHub 镜像", "github", MIRRORS[1] + API_LATEST))
+    except IndexError:                                     # 理论上不会发生
+        pass
     urls = list(extra or [])
     if not urls:
         try:
@@ -335,7 +344,7 @@ def default_sources(extra: Optional[Sequence[str]] = None) -> List[Source]:
         url = str(url or "").strip()
         if not url:
             continue
-        if url == API_LATEST:
+        if url.endswith("/releases/latest") or url == API_LATEST:
             continue
         sources.append(Source("%s %d" % (DEFAULT_SOURCE_NAME, i + 1)
                               if len(urls) > 1 else DEFAULT_SOURCE_NAME,
