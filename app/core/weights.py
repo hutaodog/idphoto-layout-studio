@@ -132,11 +132,12 @@ def sha256_file(path: str) -> str:
 
 def download(progress: Optional[Callable[[int, int], None]] = None,
              should_stop: Optional[Callable[[], bool]] = None,
-             mirrors: Sequence[str] = MIRRORS, timeout: float = 60.0) -> str:
+             mirrors: Optional[Sequence[str]] = None, timeout: float = 60.0) -> str:
     """下载模型到缓存目录并校验大小 + sha256，然后放到上游读的位置。
 
     `progress(已下字节, 总字节)`。返回模型路径。
     """
+    mirrors = MIRRORS if mirrors is None else mirrors     # 别把 MIRRORS 当默认参数（定义时求值）
     os.makedirs(cache_dir(), exist_ok=True)
     dest = cache_path()
     errors: List[str] = []

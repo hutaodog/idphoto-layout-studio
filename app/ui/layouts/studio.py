@@ -66,6 +66,15 @@ class DropArea(QFrame):
         self.update()
         super().dragLeaveEvent(e)
 
+    def dragMoveEvent(self, e):                            # noqa: N802
+        # **必须有**：Qt 的默认实现直接 ignore，drag 过程中被 ignore 之后
+        # 松手不会产生 drop 事件 —— 现象就是"拖到窗口上没有任何反应"。
+        md = e.mimeData()
+        if md.hasUrls() and any(_is_image(u.toLocalFile()) for u in md.urls()):
+            e.acceptProposedAction()
+            return
+        super().dragMoveEvent(e)
+
     def dropEvent(self, e):                                # noqa: N802
         paths = [u.toLocalFile() for u in e.mimeData().urls()
                  if _is_image(u.toLocalFile())]
@@ -119,8 +128,9 @@ def _left_column(win) -> QWidget:
 
     # 顺序按用户在截图上标的号：
     #   ① 证件照规格 ② 背景底色 ③ 构图微调 ④ 相纸与排版（v1.5.4 反馈：相纸与排版提到第 4 位）
-    #   其余（照片列表 / 输出设置 / 日志）跟在后面。
+    # 其余（输出设置 / 日志）跟在后面。
     # 「相纸与排版」默认也展开（用户 v1.5.6 反馈："把这四个默认设为展开状态"）。
+    # v1.6.6：**去掉「照片列表」**（用户："去掉照片列表那个功能，拖新的一张就把前一张覆盖了"）。
     cards = [
         SectionCard("证件照规格", strip_group(win._group_spec()), icon="id",
                     summary="一寸"),
@@ -130,14 +140,14 @@ def _left_column(win) -> QWidget:
                     summary="自动构图"),
         SectionCard("相纸与排版", strip_group(win._group_layout()), icon="grid",
                     summary="6寸 · 12 张", expanded=True),
-        SectionCard("照片列表", _photos(win), icon="list", summary="0 张"),
         SectionCard("输出设置", strip_group(win._group_output()),
                     icon="printer", summary="300 dpi", expanded=False),
     ]
     # 摘要不再是写死的：MainWindow._refresh_card_summaries() 会按当前状态刷新它们
+    # 注意：没有 "photos" 了（v1.6.6 去掉了照片列表）
     win.card_summaries = {
         "spec": cards[0], "bg": cards[1], "adjust": cards[2],
-        "layout": cards[3], "photos": cards[4], "output": cards[5],
+        "layout": cards[3], "output": cards[4],
     }
     for c in cards:
         v.addWidget(c)
@@ -185,12 +195,18 @@ def _left_column(win) -> QWidget:
 
 
 def _photos(win) -> QWidget:
+    """（已停用）以前这里的「照片列表」卡片。
+
+    v1.6.6 起工作台不再有照片列表：一张照片进来就顶掉上一张，`MainWindow.add_photos()`
+    用的是"覆盖"语义。函数留着是因为别的实验布局还在用它。
+    """
     panel = win._build_left_panel()
     panel.setMaximumWidth(16777215)
     panel.setMinimumWidth(0)
     if getattr(win, "lbl_photos_title", None) is not None:
         win.lbl_photos_title.hide()
-    win.lst_photos.setMinimumHeight(120)
+    if getattr(win, "lst_photos", None) is not None:
+        win.lst_photos.setMinimumHeight(120)
     return panel
 
 

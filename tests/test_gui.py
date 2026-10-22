@@ -224,21 +224,47 @@ def test_export_current_writes_files(win, qapp, monkeypatch):
     assert abs(w_mm - spec.mm[0]) < 0.2 and abs(h_mm - spec.mm[1]) < 0.2, (w_mm, h_mm)
 
 
-def test_batch_export(win, qapp, monkeypatch):
+def test_export_all_with_one_photo(win, qapp, monkeypatch):
+    """v1.6.6 起只有一张照片（新照片覆盖旧的），「导出全部照片」= 这张的证件照 + 排版照。"""
     silence_popups(monkeypatch)
-    win.add_photos([DEMO_IMAGE])          # 重复路径会被去重，所以换个副本名
-    import shutil
-    second = os.path.join(OUT_DIR, "第二张测试照片.jpg")
-    shutil.copyfile(DEMO_IMAGE, second)
-    win.add_photos([second])
-    assert len(win.items) >= 2
+    win.add_photos([DEMO_IMAGE])
+    assert len(win.items) == 1, "现在只保留一张照片"
     win._out_dir = os.path.join(OUT_DIR, "gui_batch")
     win._update_out_label()
+    os.makedirs(win._out_dir, exist_ok=True)
     win.on_export_all()
     ok = pump(qapp, 180, lambda: win._batch is not None and not win._batch.isRunning())
     assert ok, "批量导出超时"
-    files = os.listdir(win._out_dir)
-    assert sum(1 for f in files if f.endswith(".jpg")) >= 4, files
+    files = [f for f in os.listdir(win._out_dir) if f.endswith(".jpg")]
+    assert len(files) >= 2, files          # 证件照 + 排版照
+
+
+def test_new_photo_replaces_old_one(win, qapp, tmp_path):
+    """用户明确要求：**拖/选新的一张就把前一张覆盖掉**（不再有照片列表）。"""
+    import shutil
+
+    from conftest import DEMO_IMAGE
+
+    a = os.path.normpath(str(tmp_path / "旧照片.jpg"))
+    b = os.path.normpath(str(tmp_path / "新照片.jpg"))
+    shutil.copyfile(DEMO_IMAGE, a)
+    shutil.copyfile(DEMO_IMAGE, b)
+
+    win.add_photos([a])
+    qapp.processEvents()
+    assert len(win.items) == 1 and win.current.path == a
+
+    win.add_photos([b])
+    qapp.processEvents()
+    assert len(win.items) == 1, "应该只剩新的一张（覆盖，不是追加）"
+    assert win.current.path == b, "预览要跟着换成新照片"
+    assert not hasattr(win, "lst_photos"), "工作台布局不该再有照片列表"
+
+    # 一次给好几张 → 只认最后一张
+    win.add_photos([a, b])
+    qapp.processEvents()
+    assert len(win.items) == 1 and win.current.path == b
+    win._worker and win._worker.wait(5000)
 
 
 def test_canvas_renders_real_pixels(win, qapp):
@@ -485,8 +511,7 @@ def test_drag_pans_the_view_not_the_photo(win, qapp):
 def test_left_column_order_matches_user_marks(win, qapp):
     """左列卡片顺序 = 用户在截图里手写的编号（证件照规格 1 / 背景底色 2 / 构图微调 3）。
 
-    原来「照片列表」在最上面，用户给这三张标了 1/2/3 —— 也就是它们要排最前，
-    照片列表往后挪。
+    并且 v1.6.6 起**没有「照片列表」**了（用户："去掉照片列表那个功能"）。
     """
     from app.ui.section_card import SectionCard
 
@@ -499,8 +524,9 @@ def test_left_column_order_matches_user_marks(win, qapp):
     titles = [c.header.lbl_title.text() for c in cards]
     want = ["证件照规格", "背景底色", "构图微调"]
     assert titles[:3] == want, "左列前三张应该是 %s，实际 %s" % (want, titles)
-    assert titles.index("照片列表") > titles.index("构图微调"), (
-        "「照片列表」应该排在标了编号的三张之后，实际顺序 %s" % titles)
+    assert "照片列表" not in titles, "v1.6.6 已去掉照片列表，实际顺序 %s" % titles
+    # 日志卡固定在最后
+    assert titles[-1] == "日志", titles
 
 
 def test_titlebar_menu_and_title_share_one_line(qapp):
@@ -1079,18 +1105,57 @@ def test_second_drop_switches_preview_to_the_new_photo(win, qapp, tmp_path):
     card = win.findChild(DropArea)
     assert card is not None, "预览区里没有能接拖放的 DropArea"
 
-    n0 = len(win.items)
     _drop_files(card, [a])
     qapp.processEvents()
-    assert len(win.items) == n0 + 1
-    assert win.current.path == a
+    assert len(win.items) == 1 and win.current.path == a
 
     _drop_files(card, [b])
     qapp.processEvents()
-    assert len(win.items) == n0 + 2, "第二张没进列表"
-    assert win.current.path == b, "预览没切到第二张 —— 用户看到的就是'拖进去没反应'"
-    assert win.lst_photos.currentRow() == _row_of(win, b)   # 列表选中项也要跟着走
+    assert len(win.items) == 1, "v1.6.6：新照片覆盖旧的，不再往列表里加"
+    assert win.current.path == b, "预览没切到新拖进来的那张 —— 用户看到的就是'拖进去没反应'"
     win._worker and win._worker.wait(5000)       # 别把线程留在半路
+
+
+def test_drop_accepts_drag_move(win, qapp, tmp_path):
+    """dragEnter + **dragMove** 都要 accept，否则松手根本不产生 drop 事件。
+
+    这是"拖不进去"的第二个可能原因：QWidget 默认的 dragMoveEvent 是 ignore，
+    drag 中途一旦被 ignore，Qt 就不会再发 drop。
+    """
+    from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent
+
+    from conftest import DEMO_IMAGE
+    from app.ui.layouts.studio import DropArea
+
+    for target in (win, win.findChild(DropArea)):
+        md = QMimeData()
+        md.setUrls([QUrl.fromLocalFile(DEMO_IMAGE)])
+        pos = QPointF(10, 10)
+        enter = QDragEnterEvent(pos.toPoint(), Qt.CopyAction, md, Qt.LeftButton,
+                                Qt.NoModifier)
+        target.dragEnterEvent(enter)
+        assert enter.isAccepted(), "%r 的 dragEnterEvent 没接受" % target
+        move = QDragMoveEvent(pos.toPoint(), Qt.CopyAction, md, Qt.LeftButton,
+                              Qt.NoModifier)
+        target.dragMoveEvent(move)
+        assert move.isAccepted(), "%r 的 dragMoveEvent 没接受（会造成松手没反应）" % target
+
+
+def test_child_widgets_do_not_swallow_file_drops(win, qapp):
+    """子控件不许自己吞掉文件拖放（日志卡/搜索框/规格列表都会）。
+
+    拖到它们上面时事件被吞 → "有些地方能拖、有些地方没反应"。
+    预览区那个 DropArea 例外。
+    """
+    from PySide6.QtWidgets import QWidget
+
+    from app.ui.layouts.studio import DropArea
+
+    keep = {id(w) for w in win.findChildren(DropArea)}
+    bad = [type(w).__name__ for w in win.findChildren(QWidget)
+           if id(w) not in keep and w.acceptDrops()]
+    assert bad == [], "这些子控件还在抢拖放：%s" % bad
 
 
 def test_drop_on_whole_window_imports(win, qapp, tmp_path):
@@ -1101,17 +1166,15 @@ def test_drop_on_whole_window_imports(win, qapp, tmp_path):
 
     c = os.path.normpath(str(tmp_path / "c.jpg"))
     shutil.copyfile(DEMO_IMAGE, c)
-    n0 = len(win.items)
     _drop_files(win, [c])
     qapp.processEvents()
-    assert len(win.items) == n0 + 1
-    assert win.current.path == c
+    assert len(win.items) == 1 and win.current.path == c
     assert win.acceptDrops(), "主窗口必须开拖放"
     win._worker and win._worker.wait(5000)
 
 
-def test_dropping_existing_photo_does_not_duplicate(win, qapp, tmp_path):
-    """重复拖同一张：不重复加，但要选中它并给一句提示（不能静默无反应）。"""
+def test_dropping_same_photo_again_just_reprocesses(win, qapp, tmp_path):
+    """同一张再拖一次：不重复加，但会重算一次并给提示（不能静默无反应）。"""
     import shutil
 
     from conftest import DEMO_IMAGE
@@ -1120,17 +1183,16 @@ def test_dropping_existing_photo_does_not_duplicate(win, qapp, tmp_path):
     shutil.copyfile(DEMO_IMAGE, d)
     win.add_photos([d])
     qapp.processEvents()
-    n = len(win.items)
     win.add_photos([d])
     qapp.processEvents()
-    assert len(win.items) == n, "同一张照片不该重复进列表"
+    assert len(win.items) == 1
     assert win.current.path == d
-    assert "已经在列表里" in win.status.currentMessage()
+    assert "重算" in win.status.currentMessage()
     win._worker and win._worker.wait(5000)
 
 
-def test_import_switches_to_the_newest_of_several(win, qapp, tmp_path):
-    """一次拖进来好几张：选最后一张（用户刚看的就是它）。"""
+def test_import_keeps_only_the_last_of_several(win, qapp, tmp_path):
+    """一次拖进来好几张：只认最后一张（因为一次只处理一张）。"""
     import shutil
 
     from conftest import DEMO_IMAGE
@@ -1140,10 +1202,9 @@ def test_import_switches_to_the_newest_of_several(win, qapp, tmp_path):
         p = os.path.normpath(str(tmp_path / name))
         shutil.copyfile(DEMO_IMAGE, p)
         paths.append(p)
-    n0 = len(win.items)
     win.add_photos(paths)
     qapp.processEvents()
-    assert len(win.items) == n0 + 2
+    assert len(win.items) == 1
     assert win.current.path == paths[-1]
     win._worker and win._worker.wait(5000)
 
@@ -1359,7 +1420,9 @@ def test_default_output_dir_is_not_the_temp_extraction_dir(qapp):
 # ==================== 多布局 ====================
 
 REQUIRED_WIDGETS = (
-    "lst_specs", "lst_photos", "canvas", "sl_zoom", "sl_offset_x", "sl_offset_y",
+    # 注意：没有 "lst_photos" —— v1.6.6 按用户要求去掉了照片列表（工作台里彻底没有，
+    # 其它实验布局即便还留着它也属于可选项，不能拿来卡"功能丢了"）。
+    "lst_specs", "canvas", "sl_zoom", "sl_offset_x", "sl_offset_y",
     "sl_rotate", "sl_head", "sl_center", "cmb_paper", "sp_gap", "sp_margin",
     "cmb_crop_line", "cmb_dpi", "sp_kb", "cb_single", "cb_layout",
     "btn_export_single", "btn_export_layout", "btn_export_all", "lbl_out",

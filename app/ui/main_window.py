@@ -63,6 +63,21 @@ def _is_image_path(path: str) -> bool:
     return os.path.splitext(path or "")[1].lower() in IMAGE_EXTS
 
 
+def is_elevated() -> bool:
+    """当前进程是不是**以管理员身份**在跑。
+
+    这条直接影响拖放：Windows 的 UIPI 不允许普通权限的"资源管理器"把文件拖进
+    提权进程 —— 所以管理员身份运行时拖拽会**整个失效**（按钮导入不受影响）。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:                                      # noqa: BLE001
+        return False
+
+
 def default_out_dir() -> str:
     """默认输出目录：**程序目录下的「输出」**（不可写才退回「图片\\证件照输出」）。
 
@@ -125,6 +140,15 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         self._update_layout_info()
         self._sync_color_buttons()
         self._check_weights()
+        # 让"窗口任意位置都能拖照片进来"真的成立（子控件不许自己吞掉拖放）
+        try:
+            self._block_child_drops()
+        except Exception:                                  # noqa: BLE001
+            pass
+        if is_elevated():
+            self.status.showMessage(
+                "提示：程序是「以管理员身份」运行的，Windows 会拦住从资源管理器拖进来的文件；"
+                "要拖拽请用「帮助 → 以普通权限重新打开」")
 
     # ==================== 界面搭建 ====================
     @staticmethod
@@ -367,12 +391,11 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def _build_menu(self) -> None:
         m_file = self.menubar.addMenu("文件")
-        for text, slot, sc in (("导入照片", self.on_import, "Ctrl+O"),
-                               ("批量导入", self.on_import_many, "Ctrl+Shift+O")):
-            a = QAction(text, self)
-            a.setShortcut(sc)
-            a.triggered.connect(slot)
-            m_file.addAction(a)
+        # v1.6.6：不再有「批量导入」—— 一次只有一张照片，再导入就是替换掉它。
+        a = QAction("导入照片（替换当前照片）", self)
+        a.setShortcut("Ctrl+O")
+        a.triggered.connect(self.on_import)
+        m_file.addAction(a)
         m_file.addSeparator()
         for text, slot, sc in (("导出证件照", self.on_export_single_only, "Ctrl+S"),
                                ("导出排版照", self.on_export_layout_only, "Ctrl+L"),
@@ -408,9 +431,38 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         m_help.addAction(self.act_auto_check)
         m_help.addSeparator()
 
+        # 以管理员身份运行时，Windows 会拦住从资源管理器拖进来的文件（UIPI），
+        # 这里给一条"一键用普通权限重开"的出路 —— 不用重新安装、也不用去改快捷方式。
+        if is_elevated():
+            self.act_unelevate = QAction("以普通权限重新打开（恢复拖放文件）", self)
+            self.act_unelevate.setToolTip(
+                "管理员窗口收不到普通权限的拖放事件；用普通权限重开后就能直接把照片拖进来")
+            self.act_unelevate.triggered.connect(self.relaunch_unelevated)
+            m_help.addAction(self.act_unelevate)
+            m_help.addSeparator()
+
         a = QAction("关于 / 开源许可", self)
         a.triggered.connect(self.on_about)
         m_help.addAction(a)
+
+    def relaunch_unelevated(self) -> None:
+        """用**普通权限**重新打开自己（拖放被 UIPI 拦住时的出路）。
+
+        小技巧：让不比我们高的 `explorer.exe` 去启动 exe —— 资源管理器是普通权限，
+        它拉起来的进程也是普通权限。这样不用重装、也不用去改快捷方式。
+        """
+        import sys
+
+        exe = sys.executable
+        try:
+            subprocess.Popen(["explorer.exe", exe])
+        except Exception as e:                            # noqa: BLE001
+            show_message(self, "没法用普通权限重开",
+                         "可以手动关掉程序，再直接双击程序图标重新打开"
+                         "（不要右键选「以管理员身份运行」）。",
+                         kind="warn", detail="%r" % (e,))
+            return
+        self.close()
 
     # ==================== 检查更新 ====================
     def _on_auto_check_toggled(self, on: bool) -> None:
@@ -595,16 +647,15 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         tb.setMovable(False)
         self.act_import = QAction("+  导入照片", self)
         self.act_import.setShortcut("Ctrl+O")
+        self.act_import.setToolTip("选择一张照片（会替换掉当前这张）")
         self.act_import.triggered.connect(self.on_import)
-        self.act_import_many = QAction("批量导入", self)
-        self.act_import_many.triggered.connect(self.on_import_many)
+        # v1.6.6：去掉「批量导入」（一次只处理一张，新照片直接替换旧的）
         self.act_open_out = QAction("打开输出目录", self)
         self.act_open_out.triggered.connect(self.on_open_out_dir)
         self.act_reset_layout = QAction("恢复默认布局", self)
         self.act_reset_layout.setToolTip("把卡片摆回默认位置和大小（Ctrl+0）")
         self.act_reset_layout.triggered.connect(self.reset_layout)
-        for a in (self.act_import, self.act_import_many):
-            tb.addAction(a)
+        tb.addAction(self.act_import)
         tb.addSeparator()
         tb.addAction(self.act_open_out)
         tb.addSeparator()
@@ -1132,12 +1183,15 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             "adjust": "手动微调" if self.manual_mode else "自动构图",
             "layout": layout_text,
             "output": "%d dpi" % (self.cmb_dpi.currentData() or spec.dpi),
-            "photos": "%d 张" % len(self.items),
         }
         for key, text in texts.items():
             card = cards.get(key)
             if card is not None:
                 card.set_summary(text)
+        # 别的（实验）布局还带「照片列表」卡片时才更新它
+        photos_card = cards.get("photos")
+        if photos_card is not None:
+            photos_card.set_summary("%d 张" % len(self.items))
 
     def _update_layout_info(self) -> None:
         s = self.current_spec()
@@ -1194,6 +1248,15 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         self._drop_hot = False
         super().dragLeaveEvent(e)
 
+    def dragMoveEvent(self, e):                            # noqa: N802
+        # **必须有**：Qt 的默认 dragMoveEvent 直接 ignore，drag 中途被 ignore 之后
+        # 松手根本不会产生 drop 事件 —— 用户看到的就是"拖到窗口上完全没反应"。
+        md = e.mimeData()
+        if md.hasUrls() and any(_is_image_path(u.toLocalFile()) for u in md.urls()):
+            e.acceptProposedAction()
+            return
+        super().dragMoveEvent(e)
+
     def dropEvent(self, e):                                # noqa: N802
         self._drop_hot = False
         paths = [u.toLocalFile() for u in e.mimeData().urls()
@@ -1204,62 +1267,79 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             return
         super().dropEvent(e)
 
+    def _block_child_drops(self) -> None:
+        """把会"吃掉"文件拖放的子控件关掉，保证窗口任意位置都能接住照片。
+
+        日志卡（QPlainTextEdit）、搜索框（QLineEdit）、规格列表（QListWidget）等
+        **自己就 acceptDrops**，拖到它们上面时事件被它们吞了 ——
+        表现就是"有些地方能拖、有些地方完全没反应"。
+        预览区的 DropArea 例外（它就是专门接拖放的）。
+        """
+        keep = set()
+        try:
+            from .layouts.studio import DropArea
+            keep = {id(w) for w in self.findChildren(DropArea)}
+        except Exception:                                  # noqa: BLE001
+            pass
+        for w in self.findChildren(QWidget):
+            if id(w) in keep:
+                continue
+            if w.acceptDrops():
+                w.setAcceptDrops(False)
+
     def on_import_many(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "批量选择照片", "", IMAGE_FILTER)
-        if paths:
-            self.add_photos(paths)
+        """保留接口（老布局/老快捷键可能还连着），但语义已经变成"换一张"。"""
+        self.on_import()
 
     def add_photos(self, paths: List[str]) -> None:
-        """导入照片：**新加进来的那张自动选中并开始处理**。
+        """导入/拖入照片 —— **一张就够：新的一张直接顶掉旧的那张**。
 
-        这里踩过一个真 bug（用户："导入一张照片后，再换一张拖进去就不好使了"）：
-        以前加完只做 `setCurrentRow(0)` / 重选当前行，第二张虽然进了列表，
-        **预览却还停在第一张** —— 用户看到的就是"拖进去没反应"。
-        现在明确选中最后新加的那张；如果拖进来的全是已经有的，就选中它并说明，别静默无反应。
+        用户 v1.6.6 明确要求："去掉照片列表那个功能，一张照片拖进去之后，
+        你要再拖另一张，就把前一张覆盖了。"
+
+        所以这里不再是"往列表里加"，而是：
+        1. 只认**最后一张**（多选/多拖时以最后一张为准）；
+        2. `self.items` 直接换成只有这一张（列表控件若存在，也只剩这一行）；
+        3. 立刻选中并重新抠图。
         """
-        new_rows: List[int] = []
-        for raw in paths:
-            # 路径统一成规范形式再比：拖放给的是 `C:/x/a.jpg`，文件对话框给的是
-            # `C:\x\a.jpg`，不归一化就会把同一张照片当成两张（"重复导入"的另一半原因）。
-            p = os.path.normpath(str(raw))
-            if any(os.path.normpath(it.path) == p for it in self.items):
-                continue
-            self.items.append(PhotoItem(path=p))
-            item = QListWidgetItem(os.path.basename(p), self.lst_photos)
-            item.setToolTip(p)            # 名字被省略号截断时看这里
-            new_rows.append(len(self.items) - 1)
-        self._update_batch_label()
+        usable = [os.path.normpath(str(p)) for p in paths if str(p or "").strip()]
+        if not usable:
+            return
+        p = usable[-1]
+        same = bool(self.items) and len(self.items) == 1 and \
+            os.path.normpath(self.items[0].path) == p
+        if same:
+            # 拖/选的还是当前这张：重算一次就当"重试"，别什么都不做
+            self.status.showMessage("重算这张：%s" % os.path.basename(p))
+            self.on_photo_selected(0)
+            return
 
-        if new_rows:
-            row = new_rows[-1]
+        self.items = [PhotoItem(path=p)]
+        self.current = None
+        self.result = None
+        if getattr(self, "lst_photos", None) is not None:     # 实验布局里还有列表
             self.lst_photos.blockSignals(True)
-            self.lst_photos.setCurrentRow(row)
+            self.lst_photos.clear()
+            item = QListWidgetItem(os.path.basename(p), self.lst_photos)
+            item.setToolTip(p)
+            self.lst_photos.setCurrentRow(0)
             self.lst_photos.blockSignals(False)
-            self.on_photo_selected(row)
-            more = "（另有 %d 张已加进列表）" % (len(new_rows) - 1) if len(new_rows) > 1 else ""
-            self.status.showMessage("已导入 %s%s" % (os.path.basename(self.items[row].path),
-                                                    more))
-        elif paths:
-            p = paths[-1]
-            for i, it in enumerate(self.items):
-                if it.path == p:
-                    self.lst_photos.blockSignals(True)
-                    self.lst_photos.setCurrentRow(i)
-                    self.lst_photos.blockSignals(False)
-                    self.on_photo_selected(i)
-                    break
-            self.status.showMessage("这张已经在列表里了：%s" % os.path.basename(p))
+        self._update_batch_label()
+        self.on_photo_selected(0)
+        self.status.showMessage("已换上新照片：%s" % os.path.basename(p))
         self._refresh_card_summaries()
 
     def _update_batch_label(self) -> None:
         if getattr(self, "lbl_batch", None) is not None:
-            self.lbl_batch.setText("共 %d 张照片" % len(self.items))
+            self.lbl_batch.setText("已导入 %s" % os.path.basename(self.items[0].path)
+                                   if self.items else "还没有导入照片")
 
     def _rebuild_photo_list(self) -> None:
-        """按 self.items 重建左栏列表。
+        """按 self.items 重建左栏列表（只有自带列表的实验布局才需要）。
 
-        换布局时左栏（含 lst_photos）是**新建的控件**，条目不跟着走；
-        不重建的话界面会出现"预览里有图、列表却是空的"这种自相矛盾状态。
+        换布局时左栏是**新建的控件**，条目不跟着走；不重建会出现
+        "预览里有图、列表却是空的"这种自相矛盾状态。工作台（默认布局）已经没有列表了，
+        这里用 getattr 兜住。
         """
         if getattr(self, "lst_photos", None) is None:
             return
@@ -1270,15 +1350,10 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             item.setToolTip(it.path)
         self.lst_photos.blockSignals(False)
         self._update_batch_label()
-        self._refresh_card_summaries()          # 「照片列表」卡头要显示真实张数
+        self._refresh_card_summaries()
         if self.items:
-            row = 0
-            for i, it in enumerate(self.items):
-                if it is self.current:
-                    row = i
-                    break
             self.lst_photos.blockSignals(True)
-            self.lst_photos.setCurrentRow(row)
+            self.lst_photos.setCurrentRow(0)
             self.lst_photos.blockSignals(False)
 
     def on_photo_selected(self, row: int) -> None:
@@ -1324,7 +1399,7 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             self.reprocess_current()
 
     def _set_busy(self, busy: bool) -> None:
-        for w in (self.act_import, self.act_import_many,
+        for w in (self.act_import,
                   self.btn_export_single, self.btn_export_layout, self.btn_export_all):
             w.setEnabled(not busy)
 

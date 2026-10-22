@@ -1,14 +1,14 @@
 ; 安装版打包脚本（Inno Setup 6）
 ; 编译：ISCC.exe packaging\installer.iss
 ; 产物：dist\证件照排版助手_安装版_v<AppVersion>.exe
-;       （文件名由正文的 AppVersion 定义决定，当前 1.6.5；改版本号只需改那一处）
+;       （文件名由正文的 AppVersion 定义决定，当前 1.6.6；改版本号只需改那一处）
 ;
 ; 用 onedir 产物作为安装载荷，而不是单文件 exe：
 ; 单文件 exe 每次启动都要把 ~300MB 内容解压出来，装到本机后每次开都要等几秒；
 ; 文件夹形式是秒开。便携版仍然提供那个单文件 exe。
 
 #define AppName "证件照排版助手"
-#define AppVersion "1.6.5"
+#define AppVersion "1.6.6"
 #define AppExe "证件照排版助手.exe"
 #define AppPublisher "自用工具"
 
@@ -33,7 +33,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; 允许普通用户装到自己目录，不强制管理员
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-VersionInfoVersion=1.6.5.0
+VersionInfoVersion=1.6.6.0
 VersionInfoDescription={#AppName} 安装程序
 VersionInfoProductName={#AppName}
 VersionInfoProductVersion={#AppVersion}

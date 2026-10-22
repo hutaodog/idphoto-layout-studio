@@ -226,7 +226,7 @@ def _get(url: str, timeout: float) -> bytes:
 
 
 def fetch_latest(timeout: float = 20.0, url: str = API_LATEST,
-                 mirrors: Sequence[str] = MIRRORS) -> ReleaseInfo:
+                 mirrors: Optional[Sequence[str]] = None) -> ReleaseInfo:
     """取 latest release 信息；直连失败按镜像前缀重试。"""
     errors = []
     for prefix in mirrors:
@@ -505,7 +505,7 @@ def download(url: str, dest: str, size: int = 0, sha256: str = "",
 # ============================================================== 准备（下载 + 解压 + 写计划）
 def prepare_update(info: ReleaseInfo, kind: Optional[str] = None,
                    progress: Optional[Callable[[int, int], None]] = None,
-                   mirrors: Sequence[str] = MIRRORS,
+                   mirrors: Optional[Sequence[str]] = None,
                    should_stop: Optional[Callable[[], bool]] = None,
                    source_name: str = "", latency_ms: float = 0.0) -> UpdatePlan:
     """下载资产、解压（zip）、写 apply.json，返回更新计划。
