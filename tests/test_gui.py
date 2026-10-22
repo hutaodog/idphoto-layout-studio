@@ -1001,7 +1001,12 @@ def test_start_update_closes_main_window_and_shows_task_window(win, qapp, monkey
         win._update_downloaded(plan, task)
         assert calls["ui"] is True, "合并阶段必须带界面"
         assert calls["old_pid"] == __import__("os").getpid()
-        assert calls["geom"] and len(calls["geom"].split(",")) == 4
+        # geom 传的是 (x, y, w, h) 四元组；真正拼成 "x,y,w,h" 的活由 updater.geom_arg 干
+        # （那里踩过 TypeError，已在 test_updater 里单独守住）
+        geom = calls["geom"]
+        assert isinstance(geom, tuple) and len(geom) == 4, geom
+        assert all(isinstance(v, int) for v in geom), geom
+        assert len(updater.geom_arg(geom).split(",")) == 4
         task._finished = True
         task.close()
     finally:

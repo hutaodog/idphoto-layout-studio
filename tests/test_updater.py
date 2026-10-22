@@ -210,6 +210,65 @@ def test_wait_for_pid_zero_is_noop():
     assert up.wait_for_pid(0, timeout=0.1) is True
 
 
+def test_geom_arg_accepts_tuple_and_string():
+    """`--geom` 的格式化：**这里抛过 TypeError，用户点更新直接失败**。
+
+    v1.6.3/v1.6.4 的 bug：调用方给的是 `"600,300,520,190"` 字符串，
+    函数里又 `"%d,%d,%d,%d" % geom` → TypeError: a real number is required, not str
+    → 界面上是「没法启动合并进程」。两种输入都必须收。
+    """
+    assert up.geom_arg((600, 300, 520, 190)) == "600,300,520,190"
+    assert up.geom_arg([1, 2, 3, 4]) == "1,2,3,4"
+    assert up.geom_arg("600,300,520,190") == "600,300,520,190"     # ← 就是这条踩的坑
+    assert up.geom_arg("") == ""
+    assert up.geom_arg(None) == ""
+    assert up.geom_arg((5, 6)) == "5,6"
+    assert up.geom_arg("坏数据") == "坏数据"          # 字符串原样透传（后端会自己忽略）
+
+
+def test_spawn_applier_builds_argv(tmp_path, monkeypatch):
+    """真的走一遍 spawn_applier 的参数拼装：--ui / --geom 都要在 argv 里。
+
+    以前测试把这个函数整个 monkeypatch 掉了，所以真正的 `%d` 格式化从没被执行过 ——
+    上面那个 TypeError 就是这样漏到用户手上的。这次用假的 Popen 抓住 argv。
+    """
+    payload = tmp_path / "staged"
+    payload.mkdir()
+    fake_exe = payload / "app.exe"
+    fake_exe.write_bytes(b"x")
+    plan = up.UpdatePlan(mode="extract-copy", staging=str(tmp_path / "_update"),
+                         target_dir=str(tmp_path), target_exe=str(fake_exe),
+                         payload=str(payload), version="9.9.9")
+    (tmp_path / "_update").mkdir(exist_ok=True)
+
+    captured = {}
+
+    def fake_popen(argv, **kw):
+        captured["argv"] = argv
+        captured["kw"] = kw
+        return object()
+
+    monkeypatch.setattr(up.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(up, "dir_writable", lambda p: True)
+
+    up.spawn_applier(plan, old_pid=1234, ui=True, geom=(600, 300, 520, 190))
+    argv = captured["argv"]
+    assert argv[0].endswith("app.exe")
+    assert "--apply-update" in argv and "--old-pid" in argv
+    assert argv[argv.index("--old-pid") + 1] == "1234"
+    assert "--ui" in argv
+    assert argv[argv.index("--geom") + 1] == "600,300,520,190"
+
+    # 字符串形式的 geom 也照样能拼
+    up.spawn_applier(plan, old_pid=0, ui=True, geom="10,20,30,40")
+    assert captured["argv"][captured["argv"].index("--geom") + 1] == "10,20,30,40"
+
+
+def test_dir_writable(tmp_path):
+    assert up.dir_writable(str(tmp_path)) is True
+    assert up.dir_writable(str(tmp_path / "新目录")) is True   # 能建就算能写
+
+
 def test_cleanup_stale_removes_leftovers(tmp_path, monkeypatch):
     monkeypatch.setattr(up, "app_dir", lambda: str(tmp_path))
     (tmp_path / "_update").mkdir()

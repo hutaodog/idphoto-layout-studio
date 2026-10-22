@@ -522,6 +522,13 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         if notes:
             first = [ln.strip("# ").strip() for ln in notes.splitlines() if ln.strip()]
             win.set_note("本次更新：" + "；".join(first[:3])[:180])
+        # 装在 Program Files 又没提权时，合并那一步要弹 UAC：先把话说在前面，
+        # 别让用户下载完 130MB 才被一个弹窗吓一跳（或者更糟：什么都看不到）。
+        try:
+            if not updater.dir_writable(updater.app_dir()):
+                win.set_note("程序装在需要管理员权限的目录，合并时会弹一次 UAC 授权，点「是」即可。")
+        except Exception:                                 # noqa: BLE001
+            pass
         win.set_status("正在下载…", indeterminate=True)
         self._task_win = win
         win.cancel_requested.connect(lambda: self._cancel_update(win))
@@ -539,7 +546,7 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def _update_downloaded(self, plan, win) -> None:
         """下载 + 校验 + 解压都好了 → 交给新版本进程去做合并（带它自己的窗口）。"""
-        geom = "%d,%d,%d,%d" % (win.x(), win.y(), win.width(), win.height())
+        geom = (win.x(), win.y(), win.width(), win.height())
         try:
             updater.spawn_applier(plan, old_pid=os.getpid(), ui=True, geom=geom)
         except Exception as e:                            # noqa: BLE001

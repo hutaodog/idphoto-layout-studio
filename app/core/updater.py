@@ -596,16 +596,84 @@ def applier_exe(plan: UpdatePlan) -> str:
     raise FileNotFoundError("解压后的目录里找不到 exe：%s" % root)
 
 
+def geom_arg(geom) -> str:
+    """把窗口位置整理成 `x,y,w,h` 字符串。
+
+    **这里踩过坑**：调用方传的已经是 `"600,300,520,190"` 这种字符串，
+    函数里再 `"%d,%d,%d,%d" % geom` 就会抛
+    `TypeError: %d format: a real number is required, not str` ——
+    用户点更新后直接"没法启动合并进程"（v1.6.3/v1.6.4 的真实 bug）。
+    所以这里两种都收：元组/列表，或者已经是字符串。
+    """
+    if not geom:
+        return ""
+    if isinstance(geom, str):
+        return geom.strip()
+    try:
+        vals = [int(v) for v in geom][:4]
+    except (TypeError, ValueError):
+        return ""
+    if len(vals) < 2:
+        return ""
+    return ",".join(str(v) for v in vals)
+
+
+def dir_writable(path: str) -> bool:
+    """这个目录能不能写（能不能就地更新）。
+
+    安装在 `C:\Program Files\...` 且没有管理员权限时**不能**写 ——
+    以前会在下载完 130MB 之后才在合并那一步炸掉，很气人。
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:                                      # noqa: BLE001
+        return False
+
+
 def spawn_applier(plan: UpdatePlan, old_pid: int = 0, ui: bool = False,
-                  geom: Optional[Tuple[int, int, int, int]] = None) -> subprocess.Popen:
+                  geom=None) -> Optional[subprocess.Popen]:
     """启动新版本进程执行覆盖，然后调用方应该马上退出。
 
     `old_pid` 是"当前正在运行的进程"，新进程会等它退出再覆盖文件。
-    `ui=True` 时新版本会**弹一个进度窗口**（"正在合并 → 更新完成"），
-    `geom=(x, y, w, h)` 让那个窗口出现在旧窗口的位置，看起来像同一个窗口在继续。
+    `ui=True` 时新版本会**弹一个进度窗口**（"正在合并 → 更新完成"）。
+    `geom` 可以是 `(x, y, w, h)` 元组，也可以直接是 `"x,y,w,h"` 字符串 ——
+    它让那个窗口出现在旧窗口的位置，看起来像同一个窗口在继续。
+
+    目标目录**没有写权限**时（典型：装在 `C:\Program Files` 又没提权）改用
+    `ShellExecuteW(..., "runas", ...)` 提权启动，会弹一次 UAC；
+    用户点了"否"就抛 OSError，由调用方提示（不是卡在那里什么都不发生）。
     """
     exe = applier_exe(plan)
     cfg = os.path.join(plan.staging, "apply.json")
+    argv = [exe, "--apply-update", cfg, "--old-pid", str(int(old_pid or 0))]
+    if ui:
+        argv.append("--ui")
+        pos = geom_arg(geom)
+        if pos:
+            argv += ["--geom", pos]
+
+    if os.name == "nt" and not dir_writable(plan.target_dir):
+        # 需要管理员才能写程序目录：弹 UAC，让提权后的进程去合并
+        import ctypes
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)   # ASFW_ANY
+        except Exception:                                  # noqa: BLE001
+            pass
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", exe, subprocess.list2cmdline(argv[1:]),
+            plan.target_dir, 1)
+        if rc <= 32:
+            raise OSError(
+                "程序装在需要管理员权限的目录，自动更新需要一次 UAC 确认；"
+                "刚才没能提权成功（代码 %d）。可以右键程序→以管理员身份运行后再更新，"
+                "或者直接下载安装包覆盖安装。" % rc)
+        return None
+
     kwargs = {}
     if os.name == "nt":
         kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED | NEW_PROCESS_GROUP
@@ -617,11 +685,6 @@ def spawn_applier(plan: UpdatePlan, old_pid: int = 0, ui: bool = False,
                 ctypes.windll.user32.AllowSetForegroundWindow(-1)   # ASFW_ANY
             except Exception:                              # noqa: BLE001
                 pass
-    argv = [exe, "--apply-update", cfg, "--old-pid", str(int(old_pid or 0))]
-    if ui:
-        argv.append("--ui")
-        if geom:
-            argv += ["--geom", "%d,%d,%d,%d" % geom]
     return subprocess.Popen(argv, close_fds=True, **kwargs)
 
 
