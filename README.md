@@ -54,30 +54,36 @@
 - 下载走 GitHub（直连不通自动回退镜像）或自建节点；下载后按 `sha256` 校验
 - 可以在「帮助」菜单里关掉自动检查（关掉后程序完全不联网），`IDPHOTO_NO_UPDATE=1` 也能一票否决
 
-### 自建更新节点（可选，国内下载更快）
+### 自建更新节点（国内下载更快）
 
-程序支持把更新包放在自己的服务器上，检查更新时和 GitHub 一起测速、谁快用谁：
+程序支持把更新包放在自己的服务器上，检查更新时和 GitHub 一起测速、谁快用谁。
+默认已经指向作者自己的节点，想换成自己的就这样：
 
 ```powershell
 # 1. 打包（产出 成品软件\ 里的三个产物）
 .\scripts\package_release.ps1
 
-# 2. 一键生成节点需要的文件 → 成品软件\update\
+# 2. 生成节点需要的文件 → 成品软件\update\（update.json + 三个 ASCII 命名的包）
 .\.venv\Scripts\python.exe scripts\make_update_manifest.py --notes-file notes.md
 
-# 3. 把 成品软件\update\ 里的全部文件上传到你的目录，例如 http://你的域名/update/
-#    确认匿名能打开 http://你的域名/update/update.json 即可
+# 3. 推到服务器（SSH；默认用 ~/.ssh/id_ed25519 公钥，没有公钥才读 SSH_PASS 环境变量）
+.\.venv\Scripts\python.exe scripts\push_update_node.py --install-key
+.\.venv\Scripts\python.exe scripts\push_update_node.py
+
+# 4. 自检（脚本最后会自动做）：确认 <节点>/update.json 能匿名访问、版本号对得上
 ```
 
-节点地址写在**程序目录**的 `settings.json` 里（可以写多个）：
+`package_release.ps1` 默认在打包收尾时**自动执行 2~4 步**（`-SkipNode` 可跳过）。
+
+节点地址写在**程序目录**的 `settings.json` 里（可以写多个，每个都会参与测速）：
 
 ```json
 { "update_sources": ["http://8.133.208.128/update/update.json"] }
 ```
 
-> 注意：节点必须能**匿名**访问（云盘面板要登录的话，请放到静态目录或用直链）；
-> `update.json` 里用的是相对路径，整个目录搬走不用改内容；
-> 更新包文件名必须以 `-portable.zip` / `-onefile.exe` / `-setup.exe` 结尾（程序按后缀挑包）。
+> 节点必须能**匿名**访问（云盘面板要登录的话不行，要用静态目录或直链）；
+> `update.json` 里是相对路径，整目录搬走不用改内容；
+> 包名必须以 `-portable.zip` / `-onefile.exe` / `-setup.exe` 结尾（程序按后缀挑包）。
 
 ---
 

@@ -3,3 +3,4 @@
 PySide6-Essentials
 pytest
 pyinstaller
+paramiko        # scripts\push_update_node.py（把更新推到自己服务器上的 SSH 客户端）

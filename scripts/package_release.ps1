@@ -1,6 +1,7 @@
 param(
-    [switch]$DocsOnly      # only the .md files changed: re-zip + re-run ISCC + collect,
+    [switch]$DocsOnly,     # only the .md files changed: re-zip + re-run ISCC + collect,
                            # skip the two PyInstaller builds (binaries are unaffected by docs)
+    [switch]$SkipNode      # do not touch the self-hosted update node (offline / not wanted)
 )
 $ErrorActionPreference = 'Continue'
 # ASCII-only. Build the release set entirely on the project drive:
@@ -227,3 +228,25 @@ Get-ChildItem $dist | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1M
 
 Write-Host "=== collect into the single delivery folder ==="
 & (Join-Path $scripts 'collect_release.ps1')
+
+# ------------------------------------------------------------------ update node
+# Generate the static manifest (update.json + ASCII-named packages) and push it to the
+# self-hosted server, so the in-app "check for updates" has a fast second source next to
+# GitHub. Login uses ~/.ssh/id_ed25519 (no password anywhere on disk).
+# Skip with -SkipNode when offline or when the node does not need this build.
+if (-not $SkipNode) {
+  Write-Host ""
+  Write-Host "=== update node (self-hosted) ==="
+  $py = Join-Path $root '.venv\Scripts\python.exe'
+  if (-not (Test-Path -LiteralPath $py)) { $py = 'python' }
+  & $py (Join-Path $scripts 'make_update_manifest.py')
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "   (manifest generation FAILED -- node NOT updated)"
+  } else {
+    & $py (Join-Path $scripts 'push_update_node.py')
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host "   !! pushing to the update node FAILED (local artifacts are still fine)"
+      Write-Host "      retry later: .venv\Scripts\python.exe scripts\push_update_node.py"
+    }
+  }
+}
