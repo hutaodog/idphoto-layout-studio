@@ -15,6 +15,30 @@ import math
 import cv2
 
 
+def source_cut(x1, y1, x2, y2, img):
+    """按抠图裁切框取源 BGR；越出原图时只复制最近边缘像素。
+
+    抠图分支用透明像素表示越界，但原底色没有凭空延伸的像素。边缘复制让
+    原图有效区域保持原样，同时保证同一裁切框仍能生成固定尺寸结果。
+    """
+    h, w = img.shape[:2]
+    ys = np.clip(np.arange(int(y1), int(y2)), 0, max(0, h - 1))
+    xs = np.clip(np.arange(int(x1), int(x2)), 0, max(0, w - 1))
+    return img[np.ix_(ys, xs)].copy()
+
+
+def move_source(input_image, y_high):
+    """以源图首行复制填充，复现透明抠图的下移而不制造黑边。"""
+    if input_image is None or not y_high:
+        return input_image
+    h = input_image.shape[0]
+    shift = max(0, min(int(y_high), h))
+    if shift == 0:
+        return input_image
+    base = np.repeat(input_image[:1], shift, axis=0)
+    return np.concatenate((base, input_image[: h - shift]), axis=0)
+
+
 def adjust_photo(ctx: Context):
     # Step1. 准备人脸参数
     face_rect = ctx.face["rectangle"]
@@ -48,6 +72,11 @@ def adjust_photo(ctx: Context):
     # Step3, 裁剪框的调整
     cut_image = IDphotos_cut(x1, y1, x2, y2, ctx.matting_image)
     cut_image = cv2.resize(cut_image, (crop_size[1], crop_size[0]))
+    source_image = None
+    if getattr(ctx, "origin_image", None) is not None:
+        source_image = source_cut(x1, y1, x2, y2, ctx.origin_image)
+        source_image = cv2.resize(source_image, (crop_size[1], crop_size[0]),
+                                  interpolation=cv2.INTER_LINEAR)
     y_top, y_bottom, x_left, x_right = U.get_box(
         cut_image.astype(np.uint8), model=2, correction_factor=0
     )  # 得到 cut_image 中人像的上下左右距离信息
@@ -79,14 +108,19 @@ def adjust_photo(ctx: Context):
     # Step6. 对照片的第二轮裁剪
     if status_left_right == 0 and status_top == 0:
         result_image = cut_image
+        result_source = source_image
     else:
+        second_x1 = x1 + x_left
+        second_y1 = y1 + cut_value_top + status_top * move_value
+        second_x2 = x2 - x_right
+        second_y2 = y2 - cut_value_top + status_top * move_value
         result_image = IDphotos_cut(
-            x1 + x_left,
-            y1 + cut_value_top + status_top * move_value,
-            x2 - x_right,
-            y2 - cut_value_top + status_top * move_value,
-            ctx.matting_image,
+            second_x1, second_y1, second_x2, second_y2, ctx.matting_image,
         )
+        result_source = (source_cut(second_x1, second_y1, second_x2, second_y2,
+                                    ctx.origin_image)
+                         if source_image is not None else None)
+        # 第二次裁剪不再缩回第一裁剪框：源图与抠图必须保留完全相同的几何。
 
     # 换装参数准备
     relative_x = x - (x1 + x_left)
@@ -94,14 +128,20 @@ def adjust_photo(ctx: Context):
 
     # Step7. 当照片底部存在空隙时，下拉至底部
     result_image, y_high = move(result_image.astype(np.uint8))
+    if result_source is not None:
+        result_source = move_source(result_source.astype(np.uint8), y_high)
     relative_y = relative_y + y_high  # 更新换装参数
     
     # Step7.1 水平翻转
     if params.horizontal_flip:
         result_image = cv2.flip(result_image, 1)
+        if result_source is not None:
+            result_source = cv2.flip(result_source, 1)
 
     # Step8. 标准照与高清照转换
     result_image_standard = standard_photo_resize(result_image, standard_size)
+    original_standard = (standard_photo_resize(result_source, standard_size)
+                         if result_source is not None else None)
     result_image_hd, resize_ratio_max = resize_image_by_min(
         result_image, esp=max(600, standard_size[1])
     )
@@ -127,6 +167,7 @@ def adjust_photo(ctx: Context):
             "arr": typography_arr,
             "rotate": typography_rotate,
         },
+        original_standard,
     )
 
 

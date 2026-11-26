@@ -2,14 +2,16 @@
 """规格库：证件照尺寸、相纸尺寸、底色。
 
 三条铁律（来自调研，写进代码而不是写在文档里）：
-1. dpi 是每条规格的独立字段，禁止当成全局常量 300 —— 身份证是 350dpi，
-   按 300 打印会大 15%；反过来把 295×413px 标 350dpi 会小 8.5%。
-2. 上传像素与打印毫米是两套口径，两组值都保留，永不互相换算。
-3. 同名不同义（二寸有 35×53 与 37×49 两种口径），因此每条都带 source / confidence。
+1. dpi 是每条预设的独立字段，不能当成全局常量 300。例如库中350dpi预设
+   只改元数据为300会让打印尺寸放大约16.7%；300改350会缩小约14.3%。
+2. 上传像素与打印毫米是两套口径；上传预设的兼容毫米只供打印流程使用，非官方打印要求。
+3. 同名不同义（二寸有 35×53 与 35×49 等场景口径），因此每条都带 source / confidence；
+   已复核的来源另存 refs，记录发布方、适用范围和核验日期，不能把网页数当独立标准数。
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -74,6 +76,10 @@ class PhotoSpec:
     note: str = ""
     source: str = ""
     confidence: str = "B"
+    # 增量补录的可追溯证据；source 仍是兼容现有界面的简要摘要。
+    # scope 应区分支持/冲突的口径及其具体业务场景，verified 是查阅日期。
+    refs: Tuple[Dict[str, str], ...] = ()
+    mm_from_px: bool = False      # 数字上传预设反算的兼容打印尺寸，非官方实体要求
 
     @property
     def px_size(self) -> Tuple[int, int]:
@@ -152,6 +158,8 @@ class SpecLibrary:
                 upload=dict(s.get("upload") or {}), compose=dict(s.get("compose") or {}),
                 note=s.get("note", ""), source=s.get("source", ""),
                 confidence=s.get("confidence", "B"),
+                refs=tuple(dict(ref) for ref in (s.get("refs") or [])),
+                mm_from_px=bool(s.get("mm_from_px", False)),
             ))
 
         papers = [PaperSpec(
@@ -219,13 +227,31 @@ class SpecLibrary:
         return hits
 
     def require(self) -> None:
-        """自检：规格数量与 id 唯一性。测试与启动时都会调用。"""
+        """校验数据结构与换算，不代表已验证任何业务受理标准。"""
         if len(self.photos) < 1:
             raise ValueError("规格库为空")
         ids = [s.id for s in self.photos]
         if len(ids) != len(set(ids)):
             dup = sorted({i for i in ids if ids.count(i) > 1})
             raise ValueError("规格 id 重复: %s" % dup)
+        colors = set(self._color_by_id)
+        for spec in [*self.photos, *self.papers]:
+            values = [*spec.mm, spec.dpi, *spec.px]
+            if (len(spec.mm) != 2 or len(spec.px) != 2
+                    or any(not math.isfinite(v) or v <= 0 for v in values)
+                    or any(int(v) != v for v in [spec.dpi, *spec.px])):
+                raise ValueError("规格尺寸必须是正有限值，像素和DPI必须为整数: %s" % spec.id)
+            if any(abs(a - b) > 1 for a, b in zip(spec.px_at(spec.dpi), spec.px)):
+                raise ValueError("规格毫米、像素和DPI换算不一致: %s" % spec.id)
+        for spec in self.photos:
+            if not spec.bg or any(color not in colors for color in spec.bg):
+                raise ValueError("规格底色引用无效: %s" % spec.id)
+            if spec.confidence not in ("A", "B", "C", "D"):
+                raise ValueError("规格证据等级无效: %s" % spec.id)
+            for ref in spec.refs:
+                if (not all(ref.get(k) for k in ("title", "issuer", "url", "scope", "verified"))
+                        or not ref["url"].startswith(("https://", "http://"))):
+                    raise ValueError("规格来源记录不完整: %s" % spec.id)
 
     def set_custom_color(self, rgb: Tuple[int, int, int], name: str = "自定义") -> ColorSpec:
         """注册/更新一个自定义底色（界面上的取色器用），返回可直接当 bg id 用的 ColorSpec。"""

@@ -12,11 +12,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
+from numbers import Real
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
-
-from .io_compat import hex_to_bgr
 
 # 默认留边（毫米）：照片之间 2mm，纸张边缘 3mm（打印机不可打印区，不是出血）
 DEFAULT_GAP_MM = 2.0
@@ -25,7 +25,28 @@ DEFAULT_MARGIN_MM = 3.0
 LINE_COLOR = (200, 200, 200)   # 与上游一致的浅灰
 
 
+def _number(value, name: str, *, positive: bool = True,
+            integer: bool = False):
+    if (isinstance(value, bool) or not isinstance(value, Real)
+            or not math.isfinite(value) or (value <= 0 if positive else value < 0)
+            or (integer and value != int(value))):
+        raise ValueError("%s 必须为有限%s%s" % (
+            name, "正" if positive else "非负", "整数" if integer else "数"))
+    return int(value) if integer else value
+
+
+def _size(value, name: str) -> Tuple[int, int]:
+    try:
+        if len(value) == 2:
+            return tuple(_number(v, name, integer=True) for v in value)
+    except TypeError:
+        pass
+    raise ValueError("%s 必须包含宽和高" % name)
+
+
 def mm_to_px(mm: float, dpi: int) -> int:
+    _number(mm, "毫米尺寸", positive=False)
+    _number(dpi, "dpi", integer=True)
     return round(mm / 25.4 * dpi)
 
 
@@ -64,10 +85,10 @@ class LayoutPlan:
 def compute_grid(paper_px: Tuple[int, int], photo_px: Tuple[int, int],
                  gap_px: int, margin_px: int) -> Tuple[int, int]:
     """给定相纸与照片尺寸，算最多能排几列几行。"""
-    pw, ph = paper_px
-    iw, ih = photo_px
-    if iw <= 0 or ih <= 0:
-        return 0, 0
+    pw, ph = _size(paper_px, "相纸像素尺寸")
+    iw, ih = _size(photo_px, "照片像素尺寸")
+    gap_px = _number(gap_px, "像素间距", positive=False, integer=True)
+    margin_px = _number(margin_px, "像素留边", positive=False, integer=True)
     cols = (pw - 2 * margin_px + gap_px) // (iw + gap_px)
     rows = (ph - 2 * margin_px + gap_px) // (ih + gap_px)
     return max(0, int(cols)), max(0, int(rows))
@@ -79,17 +100,27 @@ def plan_layout(paper_px: Tuple[int, int], photo_px: Tuple[int, int],
                 paper_id: str = "custom",
                 allow_rotate: bool = True) -> LayoutPlan:
     """算出一套完整排版方案（含每张照片的左上角坐标，整块在纸面居中）。"""
+    paper_px = _size(paper_px, "相纸像素尺寸")
+    photo_px = _size(photo_px, "照片像素尺寸")
+    dpi = _number(dpi, "dpi", integer=True)
+    gap_mm = _number(gap_mm, "毫米间距", positive=False)
+    margin_mm = _number(margin_mm, "毫米留边", positive=False)
     gap_px = mm_to_px(gap_mm, dpi)
     margin_px = mm_to_px(margin_mm, dpi)
 
+    # Keep orientation selection explicit and stable: a tie always prefers the
+    # source orientation (no needless 90-degree rotation), then the first
+    # candidate in this fixed order.  This matters for square/tight layouts,
+    # where equal counts must not depend on set/dict iteration order.
     best = None   # (count, cols, rows, rotated, iw, ih)
     orientations = [False, True] if allow_rotate else [False]
     for rotated in orientations:
         iw, ih = (photo_px[1], photo_px[0]) if rotated else (photo_px[0], photo_px[1])
         cols, rows = compute_grid(paper_px, (iw, ih), gap_px, margin_px)
         count = cols * rows
-        if best is None or count > best[0]:
-            best = (count, cols, rows, rotated, iw, ih)
+        candidate = (count, cols, rows, rotated, iw, ih)
+        if best is None or (count, not rotated) > (best[0], not best[3]):
+            best = candidate
 
     _, cols, rows, rotated, iw, ih = best
     pw, ph = paper_px
@@ -134,7 +165,7 @@ def plan_for_spec(paper, spec, gap_mm: float = DEFAULT_GAP_MM,
     现在一律：dpi 取规格的（或调用方指定的），纸和照片都在这个 dpi 下由毫米换算，
     照片阵块在纸上的物理尺寸永远是准确的 25×35mm。
     """
-    d = int(dpi or spec.dpi)
+    d = _number(spec.dpi if dpi is None else dpi, "dpi", integer=True)
     return plan_layout(paper.px_at(d), spec.px_at(d), dpi=d,
                        gap_mm=gap_mm, margin_mm=margin_mm,
                        paper_id=getattr(paper, "id", "custom"),
@@ -146,6 +177,11 @@ def smallest_paper_for(count: int, photo_px: Tuple[int, int],
                        gap_mm: float = DEFAULT_GAP_MM,
                        margin_mm: float = DEFAULT_MARGIN_MM) -> Optional[LayoutPlan]:
     """反算：要排 count 张，用面积最小的相纸。"""
+    count = _number(count, "照片张数", integer=True)
+    dpi = _number(dpi, "dpi", integer=True)
+    photo_px = _size(photo_px, "照片像素尺寸")
+    _number(gap_mm, "毫米间距", positive=False)
+    _number(margin_mm, "毫米留边", positive=False)
     plans = []
     for p in papers:
         plan = plan_layout(p.px_at(dpi), photo_px, dpi=dpi, gap_mm=gap_mm,
@@ -156,19 +192,6 @@ def smallest_paper_for(count: int, photo_px: Tuple[int, int],
         return None
     plans.sort(key=lambda x: x[0])
     return plans[0][1]
-
-
-def _line_positions(origin: int, cell: int, gap: int, n: int,
-                    limit: int) -> List[int]:
-    """算出贯穿式裁剪线的位置：外沿两条 + 每两个相邻单元之间一条。"""
-    if n <= 0:
-        return []
-    half = gap // 2
-    xs = [origin - half]
-    for i in range(1, n):
-        xs.append(origin + i * (cell + gap) - half)
-    xs.append(origin + n * cell + (n - 1) * gap + half)
-    return [min(max(0, x), limit - 1) for x in xs]
 
 
 def render_layout(photo_bgr: np.ndarray, plan: LayoutPlan,
@@ -183,8 +206,9 @@ def render_layout(photo_bgr: np.ndarray, plan: LayoutPlan,
       'cross' —— 贯穿式延长线（线一直延伸到纸边，裁切时好对刀）
       'box'   —— 每张照片一个独立方框
     """
-    from .io_compat import imread  # noqa: F401  (保持模块内依赖显式)
-
+    if crop_line not in ("none", "cross", "box"):
+        raise ValueError("不支持的裁切线样式: %s" % crop_line)
+    width = _number(line_width, "裁切线宽度", integer=True)
     pw, ph = plan.paper_px
     canvas = np.zeros((ph, pw, 3), np.uint8)
     canvas[:, :] = paper_bgr
@@ -204,30 +228,55 @@ def render_layout(photo_bgr: np.ndarray, plan: LayoutPlan,
 
     iw, ih = plan.photo_px
     import cv2
+    # plan.rotated 只表示排版方向；输入照片本身仍是原始宽高，必须先旋转再缩放。
+    if plan.rotated:
+        tile = cv2.rotate(tile, cv2.ROTATE_90_CLOCKWISE)
     if tile.shape[1] != iw or tile.shape[0] != ih:
         interp = cv2.INTER_AREA if (tile.shape[1] > iw or tile.shape[0] > ih) else cv2.INTER_CUBIC
         tile = cv2.resize(tile, (iw, ih), interpolation=interp)
 
+    rendered_positions = []
     for (x, y) in plan.positions:
         if x < 0 or y < 0 or x + iw > pw or y + ih > ph:
             continue
         canvas[y:y + ih, x:x + iw] = tile
+        rendered_positions.append((x, y))
+
+    def span(boundary, limit):
+        """Center a finite-width guide on a boundary and clip safely."""
+        start = int(boundary) - width // 2
+        # At an outer paper edge the mathematical boundary is outside the
+        # array; retain the visible part inside instead of producing a gap.
+        start = min(max(0, start), max(0, limit - width))
+        return start, min(limit, start + width)
+
+    def vline(x, y0=0, y1=None):
+        y0, y1 = (max(0, int(y0)), min(ph, ph if y1 is None else int(y1)))
+        x0, x1 = span(x, pw)
+        if x0 < x1 and y0 < y1:
+            canvas[y0:y1, x0:x1] = line_color
+
+    def hline(y, x0=0, x1=None):
+        x0, x1 = (max(0, int(x0)), min(pw, pw if x1 is None else int(x1)))
+        y0, y1 = span(y, ph)
+        if x0 < x1 and y0 < y1:
+            canvas[y0:y1, x0:x1] = line_color
 
     if crop_line == "cross":
-        ox, oy = plan.origin
-        for x in _line_positions(ox, iw, plan.gap_px, plan.cols, pw):
-            canvas[:, max(0, x):x + line_width] = line_color
-        for y in _line_positions(oy, ih, plan.gap_px, plan.rows, ph):
-            canvas[max(0, y):y + line_width, :] = line_color
+        x_edges = sorted({x for x, _ in rendered_positions} |
+                         {x + iw for x, _ in rendered_positions})
+        y_edges = sorted({y for _, y in rendered_positions} |
+                         {y + ih for _, y in rendered_positions})
+        for x in x_edges:
+            vline(x)
+        for y in y_edges:
+            hline(y)
     elif crop_line == "box":
-        half = plan.gap_px // 2
-        for (x, y) in plan.positions:
-            x0, y0 = max(0, x - half), max(0, y - half)
-            x1, y1 = min(pw, x + iw + half), min(ph, y + ih + half)
-            canvas[y0:y0 + line_width, x0:x1] = line_color
-            canvas[y1 - line_width:y1, x0:x1] = line_color
-            canvas[y0:y1, x0:x0 + line_width] = line_color
-            canvas[y0:y1, x1 - line_width:x1] = line_color
+        for x, y in rendered_positions:
+            vline(x, y, y + ih + 1)
+            vline(x + iw, y, y + ih + 1)
+            hline(y, x, x + iw + 1)
+            hline(y + ih, x, x + iw + 1)
 
     return canvas
 

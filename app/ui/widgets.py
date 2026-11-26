@@ -14,7 +14,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import (QColor, QFont, QPainter, QPainterPath, QPen,
                            QPolygonF)
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
                                QLabel, QPushButton, QScrollArea, QSizePolicy,
                                QSlider, QSpinBox, QStyle, QStyleOptionButton,
@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QVBoxLayout, QWidget)
 
 from . import style
+from .corners import apply_surface, capsule_path, continuous_path
+from .spring_popup import SpringComboPopup
 
 
 class _WheelGuard:
@@ -88,9 +90,73 @@ class NoWheelComboBox(_WheelGuard, QComboBox):
         super().__init__(parent)
         # 不让"鼠标划过"就抢焦点（否则输入法/焦点高亮会乱跳）
         self.setFocusPolicy(Qt.StrongFocus)
+        self._spring_popup = None
+
+    def showPopup(self):  # noqa: N802
+        if self._spring_popup is None:
+            self._spring_popup = SpringComboPopup(self)
+        self._spring_popup.open()
+
+    def hidePopup(self):  # noqa: N802
+        if self._spring_popup is not None and self._spring_popup.isVisible():
+            self._spring_popup.request_close()
+        else:
+            super().hidePopup()
+
+    def _spring_popup_hidden(self):
+        # Reset QComboBox's pressed state without starting its native popup.
+        super().hidePopup()
+        self.update()
+
+    def _toggle_popup(self):
+        popup = self._spring_popup
+        if popup is not None and popup.isVisible() and popup._opening:
+            popup.request_close(restore_focus=True)
+        else:
+            self.showPopup()
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton and not self.isEditable():
+            self.setFocus(Qt.MouseFocusReason)
+            self._toggle_popup()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton and not self.isEditable():
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):  # noqa: N802
+        if (event.key() in (Qt.Key_F4, Qt.Key_Space)
+                or (event.key() == Qt.Key_Down and event.modifiers() & Qt.AltModifier)):
+            if not event.isAutoRepeat():
+                self._toggle_popup()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _dismiss_popup(self):
+        popup = getattr(self, "_spring_popup", None)
+        if popup is not None:
+            popup.dismiss()
+
+    def setModel(self, model):  # noqa: N802
+        self._dismiss_popup()
+        super().setModel(model)
+
+    def setModelColumn(self, column):  # noqa: N802
+        self._dismiss_popup()
+        super().setModelColumn(column)
+
+    def setRootModelIndex(self, index):  # noqa: N802
+        self._dismiss_popup()
+        super().setRootModelIndex(index)
 
     def paintEvent(self, e):                           # noqa: N802
-        """自绘下拉箭头（QSS 画出来是个小方块，见 `_paint_triangle` 的说明）。"""
+        """自绘下拉箭头，随弹簧视窗同步旋转。"""
         super().paintEvent(e)
         if not self.count():
             return
@@ -102,8 +168,11 @@ class NoWheelComboBox(_WheelGuard, QComboBox):
                                         QStyle.SC_ComboBoxArrow, self)
         if r.isValid() is False or r.isEmpty():
             r = self.rect().adjusted(self.width() - 26, 0, 0, 0)
-        _paint_triangle(p, r.center().x() + 0.5, r.center().y() + 1.0,
-                        10.0, 6.0, False, _arrow_color(self))
+        p.translate(r.center().x() + 0.5, r.center().y() + 1.0)
+        popup = self._spring_popup
+        if popup is not None and popup.isVisible():
+            p.rotate(180.0 * popup._height / max(1, popup._full_height))
+        _paint_triangle(p, 0, 0, 10.0, 6.0, False, _arrow_color(self))
 
 
 class CheckBox(QCheckBox):
@@ -173,6 +242,10 @@ class ColorSwatch(QPushButton):
             "QPushButton:checked{border:2px solid %s;}"
             % (bg, style.RADIUS, fg, style.PRIMARY)
         )
+        apply_surface(self, bg,
+                      lambda w: style.PRIMARY if w.isChecked() else
+                      ("#b9c6da" if w.underMouse() else "#c6cdd9"), style.RADIUS,
+                      border_width=lambda w: 2.0 if w.isChecked() or w.underMouse() else 1.0)
 
     def _is_dark(self) -> bool:
         h = self.css_color.lstrip("#")
@@ -250,9 +323,7 @@ class PillButton(QPushButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        rad = min(r.height(), r.width()) / 2.0
-        path = QPainterPath()
-        path.addRoundedRect(r, rad, rad)
+        path = capsule_path(r)
 
         fill, border, fg = self._palette()
 
@@ -281,6 +352,7 @@ class RoundedDialog(QDialog):
                  kind: str = "info", buttons: Sequence[str] = ("好的",),
                  detail: str = ""):
         super().__init__(parent)
+        style.install_continuous_style(QApplication.instance())
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setModal(True)
@@ -301,6 +373,7 @@ class RoundedDialog(QDialog):
         shadow.setOffset(0, 8)
         shadow.setColor(QColor(20, 28, 45, 90))
         card.setGraphicsEffect(shadow)
+        apply_surface(card, style.CARD, style.BORDER, self.RADIUS)
         outer.addWidget(card)
 
         v = QVBoxLayout(card)
@@ -342,6 +415,7 @@ class RoundedDialog(QDialog):
             inner.setTextInteractionFlags(Qt.TextSelectableByMouse)
             inner.setStyleSheet("background:transparent;color:%s;font-size:12px;" % style.MUTED)
             holder.setWidget(inner)
+            apply_surface(holder, "#f6f8fb", style.BORDER, 10)
             v.addWidget(body)
             v.addWidget(holder)
         else:

@@ -1,34 +1,21 @@
 # -*- coding: utf-8 -*-
-"""主窗口。
+"""工作台主窗口：单张导入、可复现预览和快照式导出。
 
-布局（按用户反馈重排：导出按钮从工具栏挪到右下角固定操作栏，不再需要找）：
-    菜单栏
-    工具栏：导入照片 / 批量导入 / 打开输出目录
-    ┌────────┬──────────────┬────────────────┐
-    │ 照片列表 │   预览画布     │  参数面板(滚动)  │
-    │        │              │ 1规格 2底色 3微调 │
-    │        │              │ 4相纸 5输出      │
-    ├────────┴──────────────┴────────────────┤
-    │ 底部操作栏：[输出目录] [导出证件照][导出排版照][导出全部] │
-    └────────────────────────────────────────┘
-    状态栏
-
-交互要点：
-- 预览图上按住拖动=平移，滚轮=缩放，双击=复位（毫秒级重裁，不重跑模型）
-- 所有数字框/滑块/下拉框**任何时候都不吃滚轮**（鼠标停在上面滚页面不会误改数值）
-- 换底色是即时的，手动微调模式下也即时生效
+处理线程只使用照片路径、规格与空洞修补选项。界面丢弃过期请求，
+并使用最新的底色和构图设置渲染可导出的成品。
 """
 from __future__ import annotations
 
 import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import re
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, QRectF, QSignalBlocker, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QActionGroup, QColor
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QColorDialog, QFileDialog, QFormLayout, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
@@ -50,7 +37,7 @@ from .update_dialog import UpdateDialog
 from .update_worker import (UpdateCheckWorker, UpdateDownloadWorker)
 from .widgets import (CheckBox, ColorSwatch, NoWheelComboBox, NoWheelDoubleSpinBox,
                       NoWheelSlider, NoWheelSpinBox, PillButton, show_message)
-from .worker import BatchExportWorker, ProcessWorker
+from .worker import PhotoRequest, ProcessWorker
 
 IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff);;所有文件 (*.*)"
 APP_TITLE = "证件照排版助手"
@@ -61,6 +48,17 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 def _is_image_path(path: str) -> bool:
     """拖进来的文件是不是图片（拖拽只看后缀，够用了）。"""
     return os.path.splitext(path or "")[1].lower() in IMAGE_EXTS
+
+
+def _spec_display_order(spec):
+    """寸数规格集中置顶，同寸按小/标准/大及实际尺寸排列，其余保持原顺序。"""
+    match = re.match(r"^(小|大)?([一二三四五六七八九十]|\d+(?:\.\d+)?)寸", spec.name_zh)
+    if match is None:
+        return (1, 0, 0, 0, 0)
+    variant, number = match.groups()
+    chinese = dict(zip("一二三四五六七八九十", range(1, 11)))
+    inches = chinese[number] if number in chinese else float(number)
+    return (0, inches, {"小": -1, None: 0, "大": 1}[variant], *spec.mm)
 
 
 def is_elevated() -> bool:
@@ -95,11 +93,7 @@ def default_out_dir() -> str:
 @dataclass
 class PhotoItem:
     path: str
-    result: object = None
     error: str = ""
-    transform: Optional[ManualTransform] = None
-    bg: Optional[str] = None
-    spec_id: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -118,8 +112,18 @@ class MainWindow(QMainWindow):
         self.manual_mode = False
         self.preview_layout_mode = False
         self._worker: Optional[ProcessWorker] = None
-        self._batch: Optional[BatchExportWorker] = None
-        self._pending_reprocess = False
+        self._request_seq = 0
+        self._request: Optional[PhotoRequest] = None
+        self._processed = None
+        self._process_error = ""
+        self._selected_spec_id = "cn_yicun"
+        self._close_pending = False
+        self._preserve_original_bg = False
+        try:
+            from ..core.settings import load as load_settings
+            self._preserve_original_bg = bool(load_settings().get("preserve_original_background", False))
+        except Exception:  # noqa: BLE001
+            pass
         self._bg = "white"
         # 输出目录：用户设过的（settings.json）优先；没设过或那个目录已经不可用就用默认。
         self._out_dir = self._saved_out_dir() or default_out_dir()
@@ -135,10 +139,12 @@ class MainWindow(QMainWindow):
 QMainWindow { background: transparent; }
 QToolTip { background: rgba(43, 50, 66, 0.94); }
 """)
+        style.install_continuous_style(QApplication.instance())
         self._build_ui()
         self._refresh_spec_list()
         self._update_layout_info()
         self._sync_color_buttons()
+        self._update_bg_label()
         self._check_weights()
         # 让"窗口任意位置都能拖照片进来"真的成立（子控件不许自己吞掉拖放）
         try:
@@ -199,6 +205,10 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
     def _assemble(self) -> None:
         """按 self.layout_id 装配主体；换布局时也走这里。"""
         self.split = None                      # 只有 classic 布局会设置它
+        for name in ("lst_photos", "lbl_batch", "glass_stage", "card_summaries",
+                     "left_refit", "preview_toggle"):
+            if hasattr(self, name):
+                delattr(self, name)
         body = layouts.build(self, self.layout_id)
 
         if self._frameless:
@@ -242,6 +252,7 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         if self._glass_req == "none":
             self.glass_mode = "disabled"
             self.status.showMessage("已关闭毛玻璃（IDPHOTO_GLASS=off）")
+            self._apply_round_region()
             return
         try:
             from . import acrylic
@@ -273,34 +284,37 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         self.status.showMessage("已恢复默认布局")
 
     def _apply_round_region(self) -> None:
-        """窗口四角切圆角。
-
-        顺序有讲究（都是实机量出来的，见 `acrylic.set_round_corners` 的注释）：
-        1. 先让 **DWM** 把窗口切圆 —— 对分层窗口只有这条真管用，还自带窗口阴影；
-        2. DWM 不行（老系统）才退回 `SetWindowRgn`；
-        3. 两条都不行就保持直角（不报错，不影响使用）。
-        """
+        """Use compositor corners for SCA; its acrylic ignores a Qt/native region."""
         if not self._frameless:
             return
-        try:
-            from . import acrylic
-        except Exception:                                 # noqa: BLE001
-            return
-        try:
-            if acrylic.set_round_corners(int(self.winId())):
+        from .corners import continuous_region
+        from . import acrylic
+        hwnd = int(self.winId())
+        if self.isMaximized():
+            self.clearMask()
+            acrylic.clear_round_region(hwnd)
+            self._round_mode = "maximized"
+        elif getattr(self, "glass_mode", "none").startswith("sca-"):
+            self.clearMask()
+            acrylic.clear_round_region(hwnd)
+            if acrylic.set_round_corners(hwnd):
                 self._round_mode = "dwm"
-                return
-        except Exception:                                 # noqa: BLE001
-            pass
-        if self._glass_req == "none":
-            self._round_mode = "none"
-            return
-        try:
-            ok = acrylic.apply_round_region(int(self.winId()), self.width(),
-                                            self.height(), chrome.RADIUS + 4)
-            self._round_mode = "rgn" if ok else "none"
-        except Exception:                                 # noqa: BLE001
-            self._round_mode = "none"
+            else:
+                # A clipped Qt surface cannot clip SCA. Disable the unsupported
+                # material first, so the fallback really has transparent corners.
+                acrylic.disable_glass(hwnd)
+                self.glass_mode = "none"
+                acrylic.disable_system_round_corners(hwnd)
+                self.setMask(continuous_region(QRectF(self.rect()), chrome.WINDOW_RADIUS))
+                self._round_mode = "continuous"
+        else:
+            acrylic.disable_system_round_corners(hwnd)
+            self.setMask(continuous_region(QRectF(self.rect()), chrome.WINDOW_RADIUS))
+            self._round_mode = "continuous"
+        frame = self.centralWidget()
+        if isinstance(frame, chrome.Frame):
+            frame.outline_mode = self._round_mode
+            frame.update()
 
     def nativeEvent(self, eventType, message):             # noqa: N802
         """Windows 原生消息：给无边框窗口补上边缘缩放热区。
@@ -313,11 +327,6 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             if hit is not None:
                 return True, hit
         return super().nativeEvent(eventType, message)
-
-    def resizeEvent(self, event):                          # noqa: N802
-        super().resizeEvent(event)
-        if getattr(self, "_glass_done", False):
-            self._apply_round_region()
 
     def changeEvent(self, event):                          # noqa: N802
         """最大化/还原/从最小化恢复时，窗口尺寸会变，圆角区域要跟着重设。
@@ -335,6 +344,14 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         """切换界面布局（保留接口；v1.3.0 起只有卡片仪表盘一套）。"""
         if key not in layouts.keys() or key == getattr(self, "layout_id", None):
             return
+        values = {name: getattr(self, name).value() for name in (
+            "sl_zoom", "sl_offset_y", "sl_offset_x", "sl_rotate", "sl_head", "sl_center",
+            "sp_gap", "sp_margin", "sp_kb")}
+        choices = {name: getattr(self, name).currentData() for name in (
+            "cmb_paper", "cmb_crop_line", "cmb_dpi")}
+        checks = {name: getattr(self, name).isChecked() for name in (
+            "rb_auto", "rb_manual", "rb_photo", "rb_layout", "cb_hollow", "cb_single", "cb_layout")}
+        search = self.ed_search.text()
         prev = self.layout_id
         self.layout_id = key
         try:
@@ -353,12 +370,27 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
                          % (layouts.module_for(key).NAME, e), kind="error")
             return
         self._sync_layout_menu()
-        # 控件都是新建的实例：列表条目要按 self.items 重建，否则会出现
-        # "预览里有图、左边列表却是空的"这种自相矛盾状态
+        # Restore controls without issuing inference requests or partial render updates.
+        names = list(values) + list(choices) + list(checks) + ["ed_search"]
+        blockers = [QSignalBlocker(getattr(self, name)) for name in names]
+        for name, value in values.items():
+            control = getattr(self, name)
+            control.setValue(value)
+            if hasattr(control, "value_box"):
+                control.value_box.setValue(value)
+        for name, value in choices.items():
+            control = getattr(self, name)
+            control.setCurrentIndex(control.findData(value))
+        for name, value in checks.items():
+            getattr(self, name).setChecked(value)
+        self.ed_search.setText(search)
+        del blockers
         self._rebuild_photo_list()
         self._refresh_spec_list()
         self._update_layout_info()
         self._sync_color_buttons()
+        self._update_bg_label()
+        self._block_child_drops()
         self.refresh_preview()
         self.status.showMessage("界面布局：%s" % layouts.module_for(key).NAME)
 
@@ -385,6 +417,8 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def resizeEvent(self, event):                          # noqa: N802
         super().resizeEvent(event)
+        if getattr(self, "_glass_done", False):
+            self._apply_round_region()
         # 用户没自己拖过分隔条时，跟着窗口宽度重新分配；拖过之后就不再动它
         if not getattr(self, "_user_split", True):
             self._apply_split_proportions()
@@ -499,7 +533,7 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def on_check_update(self, silent: bool = False) -> None:
         """并发探测所有更新源，挑延迟最低的。silent=True 是启动时的静默检查，失败不打扰用户。"""
-        if getattr(self, "_checking_update", False):
+        if self._close_pending or getattr(self, "_checking_update", False):
             return
         self._checking_update = True
         if not silent:
@@ -513,6 +547,8 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def _on_update_info(self, best, silent: bool) -> None:
         """best 是 updater.BestRelease（含所选源与测速结果）；兼容直接给 ReleaseInfo。"""
+        if self._close_pending:
+            return
         if isinstance(best, updater.BestRelease):
             info, src, ms = best.info, best.source, best.latency_ms
         else:
@@ -531,6 +567,8 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         self._open_update_dialog(best, auto=silent)
 
     def _on_update_error(self, msg: str, silent: bool) -> None:
+        if self._close_pending:
+            return
         if silent:
             self.status.showMessage("检查更新失败（不影响使用）")
             return
@@ -558,6 +596,8 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         """
         from .task_window import TaskWindow
 
+        if self._close_pending:
+            return
         dlg = getattr(self, "_update_dialog", None)
         if dlg is not None:
             dlg.hide()
@@ -598,6 +638,10 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def _update_downloaded(self, plan, win) -> None:
         """下载 + 校验 + 解压都好了 → 交给新版本进程去做合并（带它自己的窗口）。"""
+        if self._close_pending:
+            win.set_error("已取消更新", "正在关闭程序。")
+            win.close()
+            return
         geom = (win.x(), win.y(), win.width(), win.height())
         try:
             updater.spawn_applier(plan, old_pid=os.getpid(), ui=True, geom=geom)
@@ -610,13 +654,36 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         QTimer.singleShot(120, win.close)
         QTimer.singleShot(220, self._quit_app)
 
+    def _active_qthreads(self):
+        """Return live child QThreads so neither close nor updater teardown destroys one."""
+        found = []
+        for name in ("_worker", "_update_checker", "_update_downloader"):
+            thread = getattr(self, name, None)
+            if thread is not None and thread not in found and thread.isRunning():
+                found.append(thread)
+        return found
+
     def _quit_app(self) -> None:
         from PySide6.QtWidgets import QApplication
+        if self._active_qthreads():
+            QTimer.singleShot(50, self._quit_app)
+            return
         app = QApplication.instance()
         if app is not None:
             app.quit()
 
+    def _finish_deferred_close(self) -> None:
+        if self._active_qthreads():
+            QTimer.singleShot(50, self._finish_deferred_close)
+            return
+        self._close_timer_armed = False
+        self.close()
+
     def _update_failed(self, msg: str, win) -> None:
+        if self._close_pending:
+            win.set_error("更新已停止", "正在关闭程序。")
+            win.close()
+            return
         win.set_error("下载失败（可以点「取消」回到程序）", str(msg)[:400])
         win.btn_cancel.setText("回到程序")
         win.btn_cancel.setEnabled(True)
@@ -638,6 +705,8 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         if dlg is not None and not dlg.isVisible():
             dlg.deleteLater()
         self._update_dialog = None
+        if self._close_pending:
+            return
         self.show()
         self.raise_()
         self.status.showMessage("已取消更新，还是原来的 v%s" % __version__)
@@ -842,9 +911,16 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         self.btn_custom_color.setObjectName("ghost")
         self.btn_custom_color.clicked.connect(self.on_pick_custom_color)
         g.addWidget(self.btn_custom_color, rows, 0, 1, cols)
+        self.cb_keep_original_bg = CheckBox("保留原照片底色（不换底）")
+        self.cb_keep_original_bg.setToolTip(
+            "保留导入照片的背景纹理；照片仍会裁切和构图，超出原图范围时复制边缘像素。"
+            "启用后颜色色块不参与成品背景。")
+        self.cb_keep_original_bg.setChecked(self._preserve_original_bg)
+        self.cb_keep_original_bg.toggled.connect(self.on_preserve_original_changed)
+        g.addWidget(self.cb_keep_original_bg, rows + 1, 0, 1, cols)
         self.lbl_bg = QLabel("")
         self.lbl_bg.setStyleSheet("color:%s;" % style.MUTED)
-        g.addWidget(self.lbl_bg, rows + 1, 0, 1, cols)
+        g.addWidget(self.lbl_bg, rows + 2, 0, 1, cols)
         return gb
 
     def _group_adjust(self) -> QGroupBox:
@@ -1016,7 +1092,7 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         for d in (300, 350, 600):
             self.cmb_dpi.addItem("%d dpi" % d, d)
         # 换了分辨率，左列「输出设置」卡头的摘要也要跟着变
-        self.cmb_dpi.currentIndexChanged.connect(lambda _=None: self._refresh_card_summaries())
+        self.cmb_dpi.currentIndexChanged.connect(self._on_output_dpi_changed)
         f.addRow("输出分辨率", self.cmb_dpi)
         self.sp_kb = NoWheelSpinBox()
         self.sp_kb.setRange(0, 20480)
@@ -1104,30 +1180,43 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             specs = list(self.lib.photos)
         else:
             specs = self.lib.by_category(self.cmb_category.currentText())
+        specs = sorted(specs, key=_spec_display_order)
+        selected_id = self._selected_spec_id
         self.lst_specs.blockSignals(True)
         self.lst_specs.clear()
+        selected_row = -1
         for s in specs:
             flag = "" if s.confidence in ("A", "B") else "  · %s级未核实" % s.confidence
-            it = QListWidgetItem("%s　%.0f×%.0fmm" % (s.name_zh, s.mm[0], s.mm[1]) + flag)
+            size_text = "%g×%gmm" % s.mm
+            label = s.name_zh if size_text in s.name_zh else "%s　%s" % (s.name_zh, size_text)
+            it = QListWidgetItem(label + flag)
             it.setData(Qt.UserRole, s.id)
             it.setToolTip("%s\n%d×%dpx @%ddpi\n来源：%s（%s 级）"
                           % (s.name_zh, s.px[0], s.px[1], s.dpi, s.source, s.confidence))
             self.lst_specs.addItem(it)
+            if s.id == selected_id:
+                selected_row = self.lst_specs.count() - 1
+        self.lst_specs.setCurrentRow(selected_row)
         self.lst_specs.blockSignals(False)
-        if self.lst_specs.count():
-            self.lst_specs.setCurrentRow(0)
+        # 搜索过滤不悄悄改动规格；无匹配/被过滤时仍保留当前规格和已生成结果。
+        self._update_spec_info()
+        self._update_layout_info()
 
     def current_spec(self):
         it = self.lst_specs.currentItem()
-        if it is None:
+        spec_id = it.data(Qt.UserRole) if it is not None else self._selected_spec_id
+        try:
+            return self.lib.photo(spec_id)
+        except Exception:
             return self.lib.photo("cn_yicun")
-        return self.lib.photo(it.data(Qt.UserRole))
 
     def _update_spec_info(self) -> None:
         s = self.current_spec()
         extra = []
         if s.note:
             extra.append(s.note)
+        if s.mm_from_px:
+            extra.append("毫米为数字像素反算的兼容打印尺寸，不是官方实体尺寸要求。")
         mn, mx = s.kb_limits
         if mn or mx:
             extra.append("报名系统要求 %s" % (
@@ -1155,6 +1244,11 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
                              margin_mm=self.sp_margin.value(), dpi=dpi)
         return paper, plan, dpi
 
+    def _on_output_dpi_changed(self, _index: int) -> None:
+        self._update_layout_info()
+        if not self.preview_layout_mode:
+            self.refresh_preview()
+
     def _refresh_card_summaries(self) -> None:
         """把左列卡片的摘要刷成"当前状态"（只有工作台那套布局有这些卡）。
 
@@ -1179,7 +1273,7 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             bg_name = self._bg
         texts = {
             "spec": spec.name_zh,
-            "bg": bg_name,
+            "bg": "保留原底色" if self._preserve_original_bg else bg_name,
             "adjust": "手动微调" if self.manual_mode else "自动构图",
             "layout": layout_text,
             "output": "%d dpi" % (self.cmb_dpi.currentData() or spec.dpi),
@@ -1357,108 +1451,146 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
             self.lst_photos.blockSignals(False)
 
     def on_photo_selected(self, row: int) -> None:
-        if row < 0 or row >= len(self.items):
+        if self._close_pending or not 0 <= row < len(self.items):
             return
         self.current = self.items[row]
         self.manual_mode = False
-        self.rb_auto.setChecked(True)
+        with QSignalBlocker(self.rb_auto):
+            self.rb_auto.setChecked(True)
+        self.btn_reset.setEnabled(False)
         self._reset_sliders()
-        if self.current.result is not None:
-            self.result = self.current.result
-            self.refresh_preview()
-        else:
-            self.reprocess_current()
+        self.reprocess_current()
 
     def reprocess_current(self) -> None:
-        if self.current is None:
+        if self.current is None or self._close_pending:
             return
-        if self._worker is not None and self._worker.isRunning():
-            # 连续改规格时不能静默丢弃后一次请求，否则界面会停在上一个规格的结果上
-            self._pending_reprocess = True
-            self.status.showMessage("已排队，等当前处理完成后自动重算…")
-            return
-        spec = self.current_spec()
-        self.status.showMessage("正在处理 %s …" % self.current.name)
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)
+        self._request_seq += 1
+        self._request = PhotoRequest(self._request_seq, self.current.path,
+                                     self.current_spec(), self.cb_hollow.isChecked())
+        self._processed = self.result = None
+        self._process_error = self.current.error = ""
         self._set_busy(True)
-        w = ProcessWorker(self.proc, self.current.path, spec, self._bg,
-                          hollow_fix=self.cb_hollow.isChecked(), parent=self)
-        w.ok.connect(self.on_process_ok)
-        w.fail.connect(self.on_process_fail)
-        w.finished.connect(self._on_worker_finished)
+        self.refresh_preview()
+        if self._worker is None:
+            self._start_latest_process()
+        else:
+            self.status.showMessage("已排队，等当前处理完成后自动重算…")
+
+    def _start_latest_process(self) -> None:
+        req = self._request
+        if req is None or self._worker is not None or self._close_pending:
+            return
+        self.status.showMessage("正在处理 %s …" % os.path.basename(req.path))
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(True)
+        w = ProcessWorker(self.proc, req, parent=self)
+        w.ok.connect(self.on_process_ok, Qt.ConnectionType.QueuedConnection)
+        w.fail.connect(self.on_process_fail, Qt.ConnectionType.QueuedConnection)
+        w.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         self._worker = w
         w.start()
 
+    def _request_is_current(self, request_id: int) -> bool:
+        # 即使原地覆盖同一路径，每次导入也会分配新编号。
+        req = self._request
+        return (not self._close_pending and req is not None and req.id == request_id
+                and self.current is not None and req.path == self.current.path
+                and req.spec.id == self.current_spec().id
+                and req.hollow_fix == self.cb_hollow.isChecked())
+
+    @Slot()
     def _on_worker_finished(self) -> None:
-        self.progress.setVisible(False)
-        self.progress.setRange(0, 100)
-        self._set_busy(False)
-        if self._pending_reprocess:
-            self._pending_reprocess = False
-            self.reprocess_current()
+        w = self.sender()
+        if w is not self._worker:
+            return
+        self._worker = None
+        w.deleteLater()
+        if self._close_pending:
+            return  # closeEvent 的定时器等其余线程收尾
+        if self._request is not w.request:
+            self._start_latest_process()
+        else:
+            self.progress.setVisible(False)
+            self.progress.setRange(0, 100)
+            self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:
-        for w in (self.act_import,
-                  self.btn_export_single, self.btn_export_layout, self.btn_export_all):
+        # 处理过程中仍可换图；菜单和快捷键也会经过导出检查。
+        for w in (self.btn_export_single, self.btn_export_layout, self.btn_export_all):
             w.setEnabled(not busy)
 
-    def on_process_ok(self, res) -> None:
-        self.result = res
-        if self.current is not None:
-            self.current.result = res
-            self.current.spec_id = res.spec.id
-            self.current.bg = res.bg
-        fr = res.face_rect
-        self.status.showMessage("完成　%s　%d×%d px　%s"
-                                % (res.spec.name_zh, res.spec.px[0], res.spec.px[1],
-                                   ("人脸 %d×%d" % (fr[2], fr[3])) if fr else "未检测到人脸"))
-        self.refresh_preview()
+    @Slot(int, object)
+    def on_process_ok(self, request_id: int, res) -> None:
+        if not self._request_is_current(request_id):
+            return
+        self._processed = res
+        if self._render_cached_result():
+            self.status.showMessage("完成　%s　%d×%d px" % (res.spec.name_zh, *res.size))
 
-    def on_process_fail(self, msg: str) -> None:
-        if self.current is not None:
-            self.current.error = msg
-        self.result = None
-        self.canvas.set_image(None, "")
-        self.canvas.set_hint("处理失败：%s" % msg)
+    @Slot(int, str)
+    def on_process_fail(self, request_id: int, msg: str) -> None:
+        if not self._request_is_current(request_id):
+            return
+        self._process_error = self.current.error = msg
+        self.refresh_preview()
         self.status.showMessage("处理失败")
         show_message(self, "处理失败", msg, kind="error")
 
     def on_spec_selected(self, row: int) -> None:
         if row < 0:
             return
+        self._selected_spec_id = self.lst_specs.item(row).data(Qt.UserRole)
         self._update_spec_info()
         self._update_layout_info()
         self._refresh_card_summaries()
         self.reprocess_current()
 
-    def on_bg_changed(self, bg_id: str) -> None:
-        """换底色。
+    def _update_bg_label(self) -> None:
+        if self._preserve_original_bg:
+            text = "当前：保留原底色"
+        else:
+            color = self.lib.color(self._bg)
+            text = "当前：%s %s" % (color.name_zh, color.hex_code)
+        self.lbl_bg.setText(text)
+        for btn in [*self._color_buttons.values(), self.btn_custom_color]:
+            btn.setEnabled(not self._preserve_original_bg)
 
-        关键顺序：必须先把新底色写到 result 上，再重裁/合成。
-        之前写成「先重裁、后赋值」，导致手动微调模式下 recrop() 读到的还是旧底色，
-        必须切换一次规格才生效（用户实测反馈的 bug）。
-        """
-        self._bg = bg_id
-        c = self.lib.color(bg_id)
-        self.lbl_bg.setText("当前：%s %s" % (c.name_zh, c.hex_code))
-        self._sync_color_buttons()
-        self._refresh_card_summaries()
-        if self.result is None:
-            return
-        self.result.bg = bg_id                    # ← 先落盘，后面的重裁才会用新底色
-        if self.current is not None:
-            self.current.bg = bg_id
+    def _render_cached_result(self) -> bool:
+        if self._processed is None or self._close_pending:
+            return False
+        self.result = None  # 渲染出错时也不能导出旧成品
+        self._process_error = ""
         try:
-            if self.manual_mode:
-                # 手动构图下换底色要按当前微调参数重裁，不能只换底色就丢了几何调整
-                self.result.standard_bgr = self.proc.recrop(self.result, self.transform)
-            else:
-                self.result.standard_bgr = self.proc.recompose(self.result, bg_id)
-        except Exception as e:                            # noqa: BLE001
-            self.status.showMessage("换底色失败：%s" % e)
-            return
+            res = replace(self._processed, bg=self._bg,
+                          preserve_original=self._preserve_original_bg)
+            pixels = (self.proc.recrop(res, self.transform) if self.manual_mode
+                      else self.proc.recompose(res, self._bg))
+            self.result = replace(res, standard_bgr=pixels)
+        except Exception as e:                         # noqa: BLE001
+            self._process_error = "构图失败：%s" % e
+            self.status.showMessage(self._process_error)
         self.refresh_preview()
+        return self.result is not None
+
+    @Slot(bool)
+    def on_preserve_original_changed(self, checked: bool) -> None:
+        self._preserve_original_bg = bool(checked)
+        self._update_bg_label()
+        self._refresh_card_summaries()
+        self._render_cached_result()
+        try:
+            from ..core.settings import save as save_settings
+            save_settings(preserve_original_background=self._preserve_original_bg)
+        except OSError as e:
+            self.status.showMessage("底色选项已切换，但无法保存到下次启动：%s" % e)
+
+    def on_bg_changed(self, bg_id: str) -> None:
+        self._bg = bg_id
+        self._sync_color_buttons()
+        self._update_bg_label()
+        self._refresh_card_summaries()
+        if not self._preserve_original_bg:
+            self._render_cached_result()
 
     def on_pick_custom_color(self) -> None:
         c = QColorDialog.getColor(QColor(255, 255, 255), self, "选择背景色")
@@ -1480,13 +1612,10 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def on_mode_changed(self) -> None:
         self.manual_mode = self.rb_manual.isChecked()
-        # 自动构图下"复位"没有意义，置灰免得点了没反应还以为坏了
         self.btn_reset.setEnabled(self.manual_mode)
+        self.transform = self._transform_from_sliders() if self.manual_mode else ManualTransform()
         self._refresh_card_summaries()
-        if self.manual_mode:
-            self.on_adjust_changed()
-        else:
-            self.refresh_preview()
+        self._render_cached_result()
 
     def _reset_sliders(self) -> None:
         for w, v in ((self.sl_zoom, 0), (self.sl_offset_y, 0), (self.sl_offset_x, 0),
@@ -1513,20 +1642,11 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         )
 
     def on_adjust_changed(self) -> None:
-        if self.result is None:
-            return
         if not self.manual_mode:
             self.rb_manual.setChecked(True)
-            self.manual_mode = True
-        self.transform = self._transform_from_sliders()
-        try:
-            self.result.standard_bgr = self.proc.recrop(self.result, self.transform)
-        except Exception as e:                            # noqa: BLE001
-            self.status.showMessage("微调失败：%s" % e)
-            return
-        if self.current is not None:
-            self.current.transform = self.transform
-        self.refresh_preview()
+        else:
+            self.transform = self._transform_from_sliders()
+            self._render_cached_result()
 
     def on_canvas_panned(self, dx: float, dy: float) -> None:
         if self.result is None:
@@ -1551,141 +1671,178 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
 
     def on_canvas_reset(self) -> None:
         self._reset_sliders()
-        self.rb_auto.setChecked(True)
-        self.manual_mode = False
-        self.reprocess_current()
+        with QSignalBlocker(self.rb_auto):
+            self.rb_auto.setChecked(True)
+        self.on_mode_changed()
 
     def on_preview_mode_changed(self) -> None:
         self.preview_layout_mode = self.rb_layout.isChecked()
         self.refresh_preview()
 
-    # ==================== 预览 ====================
+    # ==================== 预览 / 导出共用渲染 ====================
+    def _output_dpi(self, spec) -> int:
+        return self.cmb_dpi.currentData() or spec.dpi
+
+    def _photo_for_output(self, result, dpi):
+        if dpi == result.spec.dpi:
+            return result.standard_bgr  # 保留办事规格定义的原生像素数
+        return resample_to_dpi(result.standard_bgr, result.spec.mm_size, dpi)
+
+    def _sheet_for_output(self, result, plan):
+        return render_layout(self._photo_for_output(result, plan.dpi), plan,
+                             crop_line=self.cmb_crop_line.currentData())
+
+    def _clear_preview(self, hint: str) -> None:
+        self.canvas.set_image(None)
+        self.canvas.set_frame_ratio(None)
+        self.canvas.set_hint(hint)
+        self.lbl_preview_info.setText("")
+
     def refresh_preview(self) -> None:
-        if self.result is None:
-            self.canvas.set_image(None, "")
-            self.canvas.set_hint("点左上角「导入照片」开始")
+        result = self.result
+        if result is None:
+            hint = ("正在处理当前照片…" if self.current else "点左上角「导入照片」开始")
+            self._clear_preview(self._process_error or hint)
             return
+        spec = result.spec
+        bg_label = "原底色" if result.preserve_original else self.lib.color(result.bg).name_zh
         if self.preview_layout_mode:
-            spec = self.current_spec()
-            paper, plan, _dpi = self._layout_plan(spec)
+            paper, plan, _ = self._layout_plan(spec)
             if plan.is_empty:
-                self.canvas.set_image(None, "")
-                self.canvas.set_hint("%s 上排不下 %s" % (paper.name_zh, spec.name_zh))
+                self._clear_preview("%s 上排不下 %s" % (paper.name_zh, spec.name_zh))
                 return
-            canvas = render_layout(self.result.standard_bgr, plan,
-                                   crop_line=self.cmb_crop_line.currentData())
-            self.canvas.set_image(canvas, "%s　共 %d 张" % (paper.name_zh, plan.count))
+            self.canvas.set_image(self._sheet_for_output(result, plan),
+                                  "%s　共 %d 张" % (paper.name_zh, plan.count))
             self.canvas.set_frame_ratio(None)
-            self.canvas.set_guides([])
-            self.lbl_preview_info.setText("排版预览　%d 列 × %d 行 = %d 张"
-                                          % (plan.cols, plan.rows, plan.count))
+            self.lbl_preview_info.setText("%d 列 × %d 行 = %d 张　%s"
+                                          % (plan.cols, plan.rows, plan.count, bg_label))
         else:
-            img = self.result.standard_bgr
-            spec = self.current_spec()
-            self.canvas.set_image(img, "%s　%d×%d px" % (spec.name_zh, spec.px[0], spec.px[1]))
-            self.canvas.set_frame_ratio(spec.px[0] / spec.px[1])
-            fr = self.result.face_rect
-            guides = []
-            if fr:
-                mh, mw = self.result.matting_bgra.shape[:2]
-                guides.append((fr[0] / mw, fr[1] / mh, fr[2] / mw, fr[3] / mh, "人脸"))
-            self.canvas.set_guides(guides)
-            self.lbl_preview_info.setText("模式：%s" % ("手动微调" if self.manual_mode else "自动构图"))
+            dpi = self._output_dpi(spec)
+            img = self._photo_for_output(result, dpi)
+            h, w = img.shape[:2]
+            self.canvas.set_image(img, "%s　%d×%d px @%d dpi" % (spec.name_zh, w, h, dpi))
+            self.canvas.set_frame_ratio(w / h)
+            self.lbl_preview_info.setText("%s　%s" % ("手动微调" if self.manual_mode else "自动构图",
+                                                    bg_label))
 
     # ==================== 导出 ====================
     def on_pick_out_dir(self) -> None:
-        """选输出目录 —— **选完就写进 settings.json，重启还是它**。"""
         d = QFileDialog.getExistingDirectory(self, "选择输出目录", self._out_dir)
         if not d:
             return
-        d = os.path.abspath(d)
-        try:
-            from ..core import settings as _settings
-            _settings.set_out_dir(d)
-        except Exception as e:                            # noqa: BLE001
-            self.status.showMessage("输出目录已切换，但保存失败：%r" % (e,))
-        self._out_dir = d
+        self._out_dir = os.path.abspath(d)
         self._update_out_label()
-        self.status.showMessage("输出目录已改为：%s（下次打开也是这里）" % d)
-        self._refresh_card_summaries()
+        try:
+            from ..core.settings import set_out_dir
+            set_out_dir(self._out_dir)
+        except OSError as e:
+            self.status.showMessage("本次输出目录已切换，但无法保存到下次启动：%s" % e)
+        else:
+            self.status.showMessage("输出目录已保存：%s" % self._out_dir)
+
+    @staticmethod
+    def _open_output_folder(directory: str) -> None:
+        try:
+            os.startfile(directory)                       # noqa: S606  (Windows)
+        except Exception:                                # noqa: BLE001
+            subprocess.Popen(["explorer.exe", directory])
 
     def on_open_out_dir(self) -> None:
-        os.makedirs(self._out_dir, exist_ok=True)
+        directory = os.path.abspath(self._out_dir)
         try:
-            os.startfile(self._out_dir)                  # noqa: S606  (Windows)
-        except Exception:                                # noqa: BLE001
-            subprocess.Popen(["explorer", self._out_dir])
+            os.makedirs(directory, exist_ok=True)
+            self._open_output_folder(directory)
+        except OSError as e:
+            self.status.showMessage("无法打开输出文件夹：%s" % directory)
+            show_message(self, "无法打开输出文件夹", directory, kind="warn", detail=str(e))
 
     def _export_kwargs(self, spec) -> Dict:
         dpi = self.cmb_dpi.currentData() or spec.dpi
         return {"dpi": dpi, "target_kb": self.sp_kb.value() or None,
                 "max_kb": spec.kb_limits[1], "min_kb": spec.kb_limits[0]}
 
-    def _guard_export(self) -> bool:
-        if self.result is None:
-            show_message(self, "还没有可导出的照片", "请先点左上角「导入照片」。", kind="info")
-            return False
-        if self._worker is not None and self._worker.isRunning():
-            show_message(self, "正在处理中", "照片还在处理，请稍候一两秒再导出。", kind="info")
-            return False
-        return True
-
-    def _spec_for_export(self):
-        """用「实际渲染所用的规格」导出，而不是下拉框当前选中的规格。
-
-        用户改了规格但后台还没处理完时，两者会不一致，按后者命名会张冠李戴。
-        """
-        spec = self.result.spec
-        cur = self.current_spec()
-        if spec.id != cur.id:
-            self.status.showMessage("提示：本次导出的是 %s（界面已切到 %s，处理完成后可再导出）"
-                                    % (spec.name_zh, cur.name_zh))
-        return spec
+    def _can_export(self) -> bool:
+        req = self._request
+        return (self.result is not None and req is not None
+                and self.result.spec.id == req.spec.id and self._request_is_current(req.id))
 
     def _do_export(self, want_single: bool, want_layout: bool) -> None:
-        if not self._guard_export():
+        if not self._can_export():
+            reason = self._process_error or ("请等待当前照片处理完成。" if self.current
+                                              else "请先导入一张照片。")
+            show_message(self, "还没有可导出的照片", reason, kind="info")
             return
         if not want_single and not want_layout:
-            show_message(self, "没有选择导出内容",
-                         "请在「5 · 输出设置」里勾选「导出证件照」或「导出排版照」。", kind="info")
+            show_message(self, "没有选择导出内容", "请在「输出设置」勾选要导出的内容。", kind="info")
             return
-        os.makedirs(self._out_dir, exist_ok=True)
-        spec = self._spec_for_export()
-        stem = os.path.splitext(self.current.name)[0] if self.current else "photo"
-        kw = self._export_kwargs(spec)
-        lines, detail = [], []
-        try:
-            if want_single:
-                p = os.path.join(self._out_dir, "%s_%s_%s.jpg" % (stem, spec.id, self._bg))
-                # 用户可能在「输出设置」里选了别的分辨率：像素跟着缩放，
-                # 保证打印出来的毫米尺寸永远是规格尺寸（见 exporter.resample_to_dpi）
-                img = resample_to_dpi(self.result.standard_bgr, spec.mm_size, kw["dpi"])
-                rep = save_image(img, p, **kw)
-                lines.append("证件照：%s（%.1f KB，%d dpi）"
-                             % (os.path.basename(p), rep.kb, rep.dpi_readback[0]))
+        result = self.result
+        spec = result.spec
+        from ..core.export_paths import export_stem, reserve_export_path
+
+        source_stem = os.path.splitext(self.current.name)[0]
+        directory = os.path.abspath(self._out_dir)
+        if result.preserve_original:
+            background = "原底色(original)"
+        else:
+            color = self.lib.color(result.bg)
+            background = color.name_zh + (color.hex_code if color.id == "custom" else "")
+        lines, detail, written = [], [], []
+        warning = False
+        failed = False
+
+        def write(image, paper=None, **kwargs):
+            stem = export_stem(source_stem, spec, background, paper)
+            with reserve_export_path(directory, stem) as path:
+                report = save_image(image, path, **kwargs)
+            written.append(path)
+            detail.extend([path, *report.messages])
+            return report
+        if want_single:
+            try:
+                kw = self._export_kwargs(spec)
+                rep = write(self._photo_for_output(result, kw["dpi"]), **kw)
+                lines.append("证件照：%s（%.1f KB）" % (os.path.basename(written[-1]), rep.kb))
                 if not rep.ok():
-                    lines.append("　注意：未满足大小或 dpi 约束，请检查「大小上限」设置")
-                detail.extend(rep.messages)
-                detail.append(p)
-            if want_layout:
+                    lines.append("单张文件未满足大小或 DPI 要求，请查看详情。")
+                    warning = True
+            except Exception as e:                        # noqa: BLE001
+                failed = True
+                lines.append("证件照导出失败：%s" % e)
+        if want_layout:
+            try:
                 paper, plan, layout_dpi = self._layout_plan(spec)
                 if plan.is_empty:
-                    lines.append("注意：%s 上排不下 %s，未导出排版照"
-                                 % (paper.name_zh, spec.name_zh))
+                    lines.append("%s 上排不下 %s，未导出排版照。" % (paper.name_zh, spec.name_zh))
+                    warning = True
                 else:
-                    canvas = render_layout(self.result.standard_bgr, plan,
-                                           crop_line=self.cmb_crop_line.currentData())
-                    p = os.path.join(self._out_dir, "%s_%s排版.jpg" % (stem, paper.id))
-                    # dpi 必须和排版时用的一致，否则打印出来的毫米尺寸会错
-                    rep = save_image(canvas, p, dpi=layout_dpi, max_kb=kw["max_kb"])
-                    lines.append("排版照：%s（%s 共 %d 张，%.1f KB）"
-                                 % (os.path.basename(p), paper.name_zh, plan.count, rep.kb))
-                    detail.append(p)
-        except Exception as e:                            # noqa: BLE001
-            show_message(self, "导出失败", str(e), kind="error")
-            return
-        self.status.showMessage("导出完成 → %s" % self._out_dir)
-        show_message(self, "导出完成", "\n".join(lines), kind="info",
+                    rep = write(self._sheet_for_output(result, plan), paper=paper, dpi=layout_dpi)
+                    lines.append("排版照：%s（%d 张，%.1f KB）"
+                                 % (os.path.basename(written[-1]), plan.count, rep.kb))
+                    if not rep.ok():
+                        lines.append("排版文件的 DPI 回读异常，请查看详情。")
+                        warning = True
+            except Exception as e:                        # noqa: BLE001
+                failed = True
+                lines.append("排版照导出失败：%s" % e)
+
+        if written:
+            # 先打开实际成品所在的目录，不让完成弹窗阻塞这一步。
+            directory = os.path.dirname(written[0])
+            try:
+                self._open_output_folder(directory)
+            except OSError as e:
+                lines.append("文件已保存，但无法打开输出文件夹：%s" % directory)
+                detail.append(str(e))
+                warning = True
+            title = ("部分导出成功" if failed else
+                     "导出结果有提示" if warning else "导出完成")
+            kind = "warn" if failed or warning else "info"
+            self.status.showMessage("%s：%s" % (title, directory))
+        else:
+            title = "导出未完成" if failed else "没有导出排版照"
+            kind = "error" if failed else "warn"
+            self.status.showMessage(title)
+        show_message(self, title, "\n".join(lines), kind=kind,
                      detail="\n".join(detail))
 
     def on_export_single_only(self) -> None:
@@ -1699,52 +1856,8 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
         self._do_export(self.cb_single.isChecked(), self.cb_layout.isChecked())
 
     def on_export_all(self) -> None:
-        if not self.items:
-            show_message(self, "还没有导入照片", "请先点左上角「导入照片」。", kind="info")
-            return
-        if not (self.cb_single.isChecked() or self.cb_layout.isChecked()):
-            show_message(self, "没有选择导出内容",
-                         "请在「5 · 输出设置」里勾选要导出的内容。", kind="info")
-            return
-        if self._batch is not None and self._batch.isRunning():
-            show_message(self, "批量导出进行中", "请等待当前批次完成。", kind="info")
-            return
-        os.makedirs(self._out_dir, exist_ok=True)
-        spec = self.current_spec()
-        pid = self.cmb_paper.currentData()
-        jobs = []
-        for it in self.items:
-            jobs.append({
-                "path": it.path, "spec": spec, "bg": self._bg,
-                "transform": (self.transform if (it is self.current and self.manual_mode)
-                              else (it.transform if it is not self.current else None)),
-                "stem": os.path.splitext(it.name)[0],
-            })
-        dpi = self.cmb_dpi.currentData() or 0
-        self.progress.setVisible(True)
-        self.progress.setRange(0, len(jobs))
-        self.progress.setValue(0)
-        w = BatchExportWorker(self.proc, jobs, self._out_dir, self.lib.paper(pid),
-                              self.sp_gap.value(), self.sp_margin.value(),
-                              self.cmb_crop_line.currentData(),
-                              target_kb=self.sp_kb.value() or 0, dpi_override=dpi,
-                              export_single=self.cb_single.isChecked(),
-                              export_layout=self.cb_layout.isChecked(), parent=self)
-        w.progress.connect(lambda i, n, s: (self.progress.setValue(i),
-                                            self.status.showMessage("%d/%d  %s" % (i, n, s))))
-        w.itemDone.connect(lambda path, ok, msg:
-                           self.status.showMessage("%s %s" % ("完成" if ok else "失败", msg)))
-        w.allDone.connect(self.on_batch_done)
-        self._batch = w
-        w.start()
-
-    def on_batch_done(self, ok: int, total: int) -> None:
-        self.progress.setVisible(False)
-        self.status.showMessage("批量导出完成：%d/%d 成功" % (ok, total))
-        show_message(self, "批量导出完成",
-                     "成功 %d / 共 %d 张。" % (ok, total),
-                     kind="info" if ok == total else "warn",
-                     detail="输出目录：\n" + self._out_dir)
+        # 单张工作流下「全部」就是基于同一预览同时导出单张与整版。
+        self.on_export_current()
 
     def on_about(self) -> None:
         from .. import APP_NAME, __version__
@@ -1773,12 +1886,19 @@ QToolTip { background: rgba(43, 50, 66, 0.94); }
                 % ("已就位" if have else "缺失（请运行 scripts\\download_weights.ps1）", weights)))
 
     def closeEvent(self, e):  # noqa: N802
-        for w in (self._worker, self._batch):
-            if w is not None and w.isRunning():
-                w.wait(3000)
-        # 检查更新的线程可能还在跑：给一点时间收尾，别让 Qt 在销毁窗口时抱怨
-        checker = getattr(self, "_update_checker", None)
-        if checker is not None and checker.isRunning():
-            checker.wait(2000)
-            self._update_checker = None
+        live = self._active_qthreads()
+        if live:
+            # Never block the GUI thread or destroy a running QThread. Cancel a download
+            # if the user explicitly closes the application, then close when all workers end.
+            downloader = getattr(self, "_update_downloader", None)
+            if downloader is not None and downloader.isRunning():
+                downloader.cancel()
+            self._close_pending = True
+            e.ignore()
+            if not getattr(self, "_close_timer_armed", False):
+                self._close_timer_armed = True
+                QTimer.singleShot(50, self._finish_deferred_close)
+            return
+        self._close_pending = True
+        self._close_timer_armed = False
         super().closeEvent(e)

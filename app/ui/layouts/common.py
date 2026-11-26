@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QAbstractButton, QFrame, QHBoxLayout, QLabel,
                                QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 from .. import style
+from ..corners import apply_surface, capsule_path, continuous_path
 
 
 class RailButton(QAbstractButton):
@@ -40,15 +41,15 @@ class RailButton(QAbstractButton):
         if checked:
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(style.PRIMARY_SOFT))
-            p.drawRoundedRect(body, 9, 9)
+            p.drawPath(continuous_path(body, 9))
         elif hovered:
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#f0f2f6"))
-            p.drawRoundedRect(body, 9, 9)
+            p.drawPath(continuous_path(body, 9))
         if checked:
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(style.PRIMARY))
-            p.drawRoundedRect(QRectF(0, 14, 3, self.height() - 28), 2, 2)
+            p.drawPath(capsule_path(QRectF(0, 14, 3, self.height() - 28)))
         p.setPen(QColor(style.PRIMARY if checked else style.MUTED_STRONG))
         f = p.font()
         f.setPointSize(8)
@@ -165,7 +166,7 @@ class _SectionHeader(QWidget):
             p.setRenderHint(QPainter.Antialiasing, True)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#f1f3f7"))
-            p.drawRoundedRect(QRectF(self.rect()).adjusted(0, 1, 0, -1), 7, 7)
+            p.drawPath(continuous_path(QRectF(self.rect()).adjusted(0, 1, 0, -1), 7))
 
 
 class CollapsibleSection(QWidget):
@@ -224,8 +225,9 @@ def card(widget: QWidget, title: str = "", tools: QWidget = None) -> QFrame:
     """把任意控件包进一张卡片（标题行 + 内容）。"""
     f = QFrame()
     f.setObjectName("dashCard")
-    f.setStyleSheet("QFrame#dashCard{background:%s;border:1px solid %s;border-radius:12px;}"
-                    % (style.CARD, style.BORDER))
+    f.setStyleSheet("QFrame#dashCard{background:%s;border:1px solid %s;border-radius:%dpx;}"
+                    % (style.CARD, style.BORDER, style.PANEL_RADIUS))
+    apply_surface(f, style.CARD, style.BORDER, style.PANEL_RADIUS)
     v = QVBoxLayout(f)
     v.setContentsMargins(12, 10, 12, 12)
     v.setSpacing(8)

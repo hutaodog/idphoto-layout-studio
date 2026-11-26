@@ -7,18 +7,20 @@
 """
 from __future__ import annotations
 
-from typing import List, Optional
+import time
+from typing import List
 
-from PySide6.QtCore import (Property, QEasingCurve, QPropertyAnimation, QRectF,
-                            Qt, Signal)
+from PySide6.QtCore import (Property, QAbstractAnimation, QEvent, QRectF,
+                            QSignalBlocker, Qt, QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from . import style
+from .corners import capsule_path
+from .motion import SELECTION, spring_state
 
 H = 36              # 胶囊高度（v1.5.3：用户反馈"太扁了"，从 30 加到 36）
 PAD = 4             # 滑块与胶囊边的间距
-ANIM_MS = 170       # 切换时滑块滑过去的时长
 
 
 class SegmentedControl(QWidget):
@@ -39,36 +41,92 @@ class SegmentedControl(QWidget):
         for t in self._items:
             w += self._text_w(t) + 26
         self.setFixedWidth(w)
-        self._anim = QPropertyAnimation(self, b"sliderPos", self)
-        self._anim.setDuration(ANIM_MS)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._velocity = 0.0
+        self._start_pos = self._pos
+        self._start_velocity = 0.0
+        self._target_pos = self._pos
+        self._started_at = time.perf_counter()
+        # Keep Qt's shared animation clock and its inspectable running state;
+        # the values are ticks, while the spring retains momentum on retarget.
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(1000)
+        self._anim.valueChanged.connect(self._tick_transition)
+        self._anim.finished.connect(self._finish_transition)
 
     # ------------------------------------------------------------------ 动画
     def _get_pos(self) -> float:
         return self._pos
 
     def _set_pos(self, v: float) -> None:
-        self._pos = float(v)
+        self._pos = max(0.0, min(float(max(0, len(self._items) - 1)), float(v)))
         self.update()
 
     sliderPos = Property(float, _get_pos, _set_pos)
+
+    def _spring_state(self, elapsed: float) -> tuple[float, float]:
+        position, velocity = spring_state(
+            self._start_pos, self._start_velocity, self._target_pos, elapsed,
+            frequency=SELECTION.frequency, damping=SELECTION.damping)
+        # Numerical guards keep the selected capsule inside its shell, even if
+        # a caller set sliderPos directly before starting a transition.
+        end = float(max(0, len(self._items) - 1))
+        if position <= 0.0:
+            return 0.0, max(0.0, velocity)
+        if position >= end:
+            return end, min(0.0, velocity)
+        return position, velocity
+
+    def _tick_transition(self, _value=None) -> None:
+        if self._anim.state() != QAbstractAnimation.Running:
+            return
+        position, self._velocity = self._spring_state(time.perf_counter() - self._started_at)
+        self._set_pos(position)
+        segment_width = self._seg_rect(0).width()
+        if (abs(self._pos - self._target_pos) * segment_width < 0.05
+                and abs(self._velocity) * segment_width < 0.5):
+            self._finish_transition()
+
+    def _finish_transition(self) -> None:
+        self._anim.stop()
+        self._velocity = self._start_velocity = 0.0
+        self._start_pos = self._target_pos = float(self._current)
+        self._set_pos(self._target_pos)
+
+    def _start_transition(self) -> None:
+        # Retarget the last rendered state. Sampling the old curve here would
+        # move the capsule synchronously between animation frames on a click.
+        self._start_pos = self._pos
+        self._start_velocity = self._velocity
+        self._target_pos = float(self._current)
+        self._started_at = time.perf_counter()
+        # Resetting Qt's clock at its old currentTime can emit stale values.
+        # Starting is blocked too, so setup cannot produce a visible frame.
+        with QSignalBlocker(self._anim):
+            self._anim.stop()
+            self._anim.setCurrentTime(0)
+            self._anim.start()
 
     # ------------------------------------------------------------------ 数据
     def current(self) -> int:
         return self._current
 
     def set_current(self, i: int, animate: bool = True) -> None:
-        if not (0 <= i < len(self._items)) or i == self._current:
+        if not (0 <= i < len(self._items)):
+            return
+        changed = i != self._current
+        if not changed and animate:
             return
         self._current = i
-        if animate and self.isVisible():
-            self._anim.stop()
-            self._anim.setStartValue(self._pos)
-            self._anim.setEndValue(float(i))
-            self._anim.start()
+        if (animate and self.isVisible() and self.isEnabled()
+                and (self._pos != float(i) or self._velocity != 0.0)):
+            self._start_transition()
         else:
-            self._set_pos(float(i))
-        self.currentChanged.emit(i)
+            # An explicit snap also cancels an animation to this same index.
+            self._finish_transition()
+        if changed:
+            self.currentChanged.emit(i)
 
     def _text_w(self, text: str) -> int:
         f = QFont(self.font())
@@ -107,26 +165,34 @@ class SegmentedControl(QWidget):
         self.update()
         super().leaveEvent(e)
 
+    def hideEvent(self, event):                            # noqa: N802
+        self._finish_transition()
+        super().hideEvent(event)
+
+    def changeEvent(self, event):                          # noqa: N802
+        if event.type() == QEvent.EnabledChange and not self.isEnabled():
+            self._finish_transition()
+        super().changeEvent(event)
+
     # ------------------------------------------------------------------ 绘制
     def paintEvent(self, e):                               # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        rad = r.height() / 2.0
 
         # 胶囊底
         p.setPen(QPen(QColor(style.BORDER_STRONG), 1))
         p.setBrush(QColor("#eceef2"))
-        p.drawRoundedRect(r, rad, rad)
+        p.drawPath(capsule_path(r))
 
         # 选中滑块（位置带小数 → 动画时停在两段之间）
         sel = self._seg_rect(self._pos)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(12, 18, 32, 18))
-        p.drawRoundedRect(sel.adjusted(0, 1.5, 0, 2.5), sel.height() / 2, sel.height() / 2)
+        p.drawPath(capsule_path(sel.adjusted(0, 1.5, 0, 2.5)))
         p.setPen(QPen(QColor(style.BORDER), 1))
         p.setBrush(QColor(style.CARD))
-        p.drawRoundedRect(sel, sel.height() / 2, sel.height() / 2)
+        p.drawPath(capsule_path(sel))
 
         # 文字
         f = QFont(self.font())

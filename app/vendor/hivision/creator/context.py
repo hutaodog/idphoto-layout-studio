@@ -109,10 +109,14 @@ class Result:
         clothing_params: Optional[dict],
         typography_params: Optional[dict],
         face: Optional[Tuple[int, int, int, int, float]],
+        original_standard: Optional[np.ndarray] = None,
+        original_source: Optional[np.ndarray] = None,
     ):
         self.standard = standard
         self.hd = hd
         self.matting = matting
+        self.original_standard = original_standard
+        self.original_source = original_source
         self.clothing_params = clothing_params
         """
         服装参数，仅换底时为 None

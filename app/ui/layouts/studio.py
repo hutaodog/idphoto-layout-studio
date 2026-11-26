@@ -16,12 +16,13 @@ import os
 import time
 from typing import List
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPlainTextEdit,
                                QScrollArea, QVBoxLayout, QWidget)
 
 from .. import style
+from ..corners import apply_surface, continuous_path
 from ..panel_stage import strip_group
 from ..section_card import SectionCard
 from ..segmented import SegmentedControl
@@ -95,11 +96,11 @@ class DropArea(QFrame):
         r = self.rect().adjusted(3, 3, -3, -3)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(47, 111, 208, 22))
-        p.drawRoundedRect(r, 12, 12)
+        p.drawPath(continuous_path(QRectF(r), 12))
         pen = QPen(QColor(style.PRIMARY), 2, Qt.DashLine)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(r, 12, 12)
+        p.drawPath(continuous_path(QRectF(r), 12))
         p.setPen(QColor(style.PRIMARY))
         f = p.font()
         f.setPointSizeF(11.5)
@@ -120,6 +121,83 @@ def build(win) -> QWidget:
 
 
 # ====================================================================== 左列
+class _CardScrollArea(QScrollArea):
+    """Keep a visible header anchored while card heights change above/below it.
+
+    Shrinking a bottom-scrolled widget normally clamps its scroll value on
+    every layout. The existing bottom stretch instead retains only the space
+    needed by the current viewport. Scrolling up releases it; expanding cards
+    absorbs it. It is never added to the previous retained height.
+    """
+
+    def __init__(self, cards):
+        super().__init__()
+        self._cards = cards
+        self._anchor = None
+        self._adjusting_scroll = False
+        self.verticalScrollBar().valueChanged.connect(self._scroll_changed)
+        for card in cards:
+            card.heightAboutToChange.connect(self._before_height_change)
+
+    def _retain_viewport(self, value):
+        inner = self.widget()
+        # An explicit QWidget minimum overrides QScrollArea's size-hint
+        # minimum, so never let this floor squeeze the cards' natural layout.
+        natural = inner.layout().minimumSize().height()
+        inner.setMinimumHeight(max(natural, self.viewport().height() + value) if value > 0 else 0)
+
+    def _before_height_change(self):
+        inner = self.widget()
+        if inner is None or not inner.isVisible():
+            return
+        value = self.verticalScrollBar().value()
+        if self._anchor is None:
+            # A card above the viewport can also be collapsing. Follow the
+            # first reachable header, rather than leaving the entire view blank.
+            headers = [c.header for c in self._cards if c.isVisible()]
+            header = next((h for h in headers if h.mapTo(inner, QPoint()).y() + h.height() > value), None)
+            if header is not None:
+                self._anchor = (header, header.mapTo(inner, QPoint()).y() - value)
+        self._retain_viewport(value)
+
+    def _scroll_changed(self, value):
+        if self._adjusting_scroll:
+            return
+        self._anchor = None
+        inner = self.widget()
+        if inner is not None and inner.minimumHeight():
+            natural = inner.layout().minimumSize().height()
+            if natural >= self.viewport().height() + value:
+                inner.setMinimumHeight(0)
+            else:
+                self._retain_viewport(value)
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if watched is self.widget() and event.type() == QEvent.LayoutRequest:
+            anchor, self._anchor = self._anchor, None
+            self._adjusting_scroll = True
+            try:
+                # Grow before activating: a spring can cross the old floor by
+                # just one pixel. Measuring its header in a squeezed layout
+                # would otherwise turn that temporary squeeze into scroll drift.
+                natural = watched.layout().minimumSize().height()
+                watched.setMinimumHeight(max(watched.minimumHeight(), natural))
+                watched.layout().activate()
+                result = super().eventFilter(watched, event)
+                if anchor is not None:
+                    header, top = anchor
+                    value = max(0, header.mapTo(watched, QPoint()).y() - top)
+                    self._retain_viewport(value)
+                    self.verticalScrollBar().setValue(value)
+                # Remove redundant retention as soon as opening content fills it.
+                if watched.layout().minimumSize().height() >= watched.minimumHeight():
+                    watched.setMinimumHeight(0)
+                return result
+            finally:
+                self._adjusting_scroll = False
+        return super().eventFilter(watched, event)
+
+
 def _left_column(win) -> QWidget:
     inner = QWidget()
     v = QVBoxLayout(inner)
@@ -153,10 +231,11 @@ def _left_column(win) -> QWidget:
         v.addWidget(c)
 
     log = _LogView(win)
-    v.addWidget(SectionCard("日志", log, icon="log", expanded=False))
+    log_card = SectionCard("日志", log, icon="log", expanded=False)
+    v.addWidget(log_card)
     v.addStretch(1)
 
-    scroll = QScrollArea()
+    scroll = _CardScrollArea(cards + [log_card])
     scroll.setWidgetResizable(True)
     scroll.setWidget(inner)
     scroll.setFrameShape(QFrame.NoFrame)
@@ -167,28 +246,11 @@ def _left_column(win) -> QWidget:
     scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
 
     def refit() -> None:
-        """按内容重算列宽（**按最坏情况算**）。
-
-        两个坑：
-        1. 列宽必须每次展开/折叠后重算 —— 「相纸与排版 / 输出设置」默认折叠，
-           只算一次的话用户展开后内容变宽、列宽没变，右边就被硬裁
-           （combo 和输入框全被切一半，用户截图里就是这个问题）。
-        2. 但**不能按"当前状态"量**：折叠状态量不到展开后的需求，算出来偏窄，
-           连摘要文字都会被裁（"0 张"只剩"0"）。所以这里临时把卡片全部展开量一次，
-           量完再还原 —— 一次性的开销，换来列宽永远够。
-        """
-        states = [c.is_expanded() for c in cards]
-        for c in cards:
-            c.set_expanded(True)
-        need = inner.minimumSizeHint().width() + 16
-        for c, st in zip(cards, states):
-            c.set_expanded(st)
+        """按全部内容的自然宽度量列宽，折叠或回弹中也无需切换卡片状态。"""
+        need = max(c.expanded_size_hint().width() for c in cards) + 16
         scroll.setFixedWidth(max(LEFT_W, min(LEFT_W_MAX, need)))
 
-    for c in cards:
-        # SectionCard 自己在 __init__ 里连了 header.clicked -> toggle，那个先执行，
-        # 所以这里能拿到展开之后的尺寸
-        c.header.clicked.connect(refit)
+    # 展开只改变高度；列宽已按全部正文量过，点击时无需再次遍历布局。
     refit()
     win.left_refit = refit          # 便于测试和窗口尺寸变化时重算
     return scroll
@@ -222,6 +284,7 @@ class _LogView(QPlainTextEdit):
         self.setStyleSheet(
             "QPlainTextEdit{background:#fafbfc;border:1px solid %s;border-radius:8px;"
             "color:%s;font-size:11px;padding:6px;}" % (style.BORDER, style.MUTED_STRONG))
+        apply_surface(self, "#fafbfc", style.BORDER, 8)
         self._append("就绪")
         try:
             win.status.messageChanged.connect(self._on_status)
@@ -265,8 +328,9 @@ def _preview_area(win) -> QWidget:
     card.setObjectName("previewCard")
     card.setAttribute(Qt.WA_StyledBackground, True)
     card.setStyleSheet(
-        "QFrame#previewCard{background:%s;border:1px solid %s;border-radius:14px;}"
-        % (style.CARD, style.BORDER))
+        "QFrame#previewCard{background:%s;border:1px solid %s;border-radius:%dpx;}"
+        % (style.CARD, style.BORDER, style.PANEL_RADIUS))
+    apply_surface(card, style.CARD, style.BORDER, style.PANEL_RADIUS)
     card.filesDropped.connect(win.add_photos)      # 拖进来就导入
     v = QVBoxLayout(card)
     v.setContentsMargins(16, 12, 16, 16)
@@ -293,7 +357,12 @@ def _preview_area(win) -> QWidget:
 
     seg.currentChanged.connect(
         lambda i: (win.rb_photo if i == 0 else win.rb_layout).setChecked(True))
-    win.rb_photo.toggled.connect(
-        lambda on: seg.set_current(0 if on else 1, animate=False))
+    def sync_preview_toggle(on):
+        index = 0 if on else 1
+        # A radio echo of the same click must not snap the moving capsule.
+        if seg.current() != index:
+            seg.set_current(index, animate=False)
+
+    win.rb_photo.toggled.connect(sync_preview_toggle)
     win.preview_toggle = seg          # 方便外部/测试取用
     return card

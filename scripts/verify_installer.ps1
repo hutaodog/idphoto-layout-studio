@@ -35,6 +35,12 @@ $outDir  = Join-Path $work 'out'
 $smGroup = Join-Path $env:APPDATA ('Microsoft\Windows\Start Menu\Programs\' + $appName)
 $uninsKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{7C3F2A64-9E1B-4D57-8A2C-5F0D6B4E1C93}_is1'
 
+# Never overwrite an existing user's install registration or Start Menu shortcuts.
+if ((Test-Path $uninsKey) -or @(Get-ChildItem $smGroup -Filter '*.lnk' -ErrorAction SilentlyContinue).Count -gt 0) {
+  Write-Host 'ABORT: an existing installation or Start Menu shortcut is present; use a clean test profile.'
+  exit 1
+}
+
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $work, $outDir | Out-Null
 

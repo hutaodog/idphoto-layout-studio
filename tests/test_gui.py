@@ -49,9 +49,18 @@ def qapp():
 @pytest.fixture(scope="module")
 def win(qapp):
     os.makedirs(OUT_DIR, exist_ok=True)
+    from app.core import settings
+    patch = pytest.MonkeyPatch()
+    patch.setenv("IDPHOTO_NO_UPDATE", "1")
+    patch.setattr(MainWindow, "_open_output_folder", staticmethod(lambda directory: None))
+    patch.setattr(settings, "settings_path", lambda: os.path.join(OUT_DIR, "gui-settings.json"))
+    settings.save(preserve_original_background=False)
     w = MainWindow(SpecLibrary.load())
     yield w
     w.close()
+    assert pump(qapp, 60, lambda: not w._active_qthreads())
+    qapp.processEvents()
+    patch.undo()
 
 
 def pump(app, seconds=30.0, until=None):
@@ -75,14 +84,13 @@ def test_window_builds(win):
 def test_spec_selection_updates_info_and_layout(win):
     win.ed_search.setText("二寸")
     assert win.lst_specs.count() >= 1
-    # 去重后「小二寸」等名字并进了别名，搜「二寸」的第一条可能是「大一寸」——
-    # 这里挑出名字就是「二寸」的那条来选（搜得到名字也算功能没丢）
-    names = [win.lst_specs.item(i).text() for i in range(win.lst_specs.count())]
-    row = next(i for i, t in enumerate(names) if t.startswith("二寸"))
+    row = next(i for i in range(win.lst_specs.count())
+               if win.lst_specs.item(i).data(Qt.UserRole) == "cn_ercun")
     win.lst_specs.setCurrentRow(row)
     spec = win.current_spec()
-    assert spec.name_zh == "二寸", spec.name_zh
+    assert spec.id == "cn_ercun"
     win.ed_search.setText("")
+    assert win.current_spec().id == "cn_ercun"
     info = win.lbl_spec_info.text()
     assert "px" in info and "dpi" in info
 
@@ -155,6 +163,7 @@ def select_spec(win, spec_id):
 
 def test_layout_preview_and_crop_line_switch(win, qapp):
     select_spec(win, "cn_yicun")
+    assert pump(qapp, 60, lambda: win.result is not None and win._worker is None)
     win.rb_layout.setChecked(True)
     win.cmb_paper.setCurrentIndex(1)          # 6寸
     win.cmb_crop_line.setCurrentIndex(0)      # 贯穿式
@@ -181,7 +190,7 @@ def ensure_photo(win, qapp):
     """保证窗口里有一张已处理完成的照片，让测试可以单独运行而不依赖执行顺序。"""
     if win.result is None:
         win.add_photos([DEMO_IMAGE])
-    ok = pump(qapp, 60, lambda: win.result is not None)
+    ok = pump(qapp, 60, lambda: win._can_export() and win._worker is None)
     assert ok, "处理没有返回结果：%s" % (win.items[0].error if win.items else "无照片")
     return win.result
 
@@ -232,9 +241,8 @@ def test_export_all_with_one_photo(win, qapp, monkeypatch):
     win._out_dir = os.path.join(OUT_DIR, "gui_batch")
     win._update_out_label()
     os.makedirs(win._out_dir, exist_ok=True)
+    assert pump(qapp, 60, lambda: win._can_export() and win._worker is None)
     win.on_export_all()
-    ok = pump(qapp, 180, lambda: win._batch is not None and not win._batch.isRunning())
-    assert ok, "批量导出超时"
     files = [f for f in os.listdir(win._out_dir) if f.endswith(".jpg")]
     assert len(files) >= 2, files          # 证件照 + 排版照
 
@@ -1261,7 +1269,7 @@ def test_window_edges_are_not_resize_zones(win, qapp):
 
 
 def test_window_rounding_attempted(win, qapp):
-    """窗口圆角：走 DWM 圆角偏好，失败才退回 SetWindowRgn，绝不能两条都失败还不吭声。"""
+    """系统亚克力用真正生效的DWM圆角；透明降级用连续曲率区域。"""
     win.resize(1200, 800)
     win.show()
     qapp.processEvents()
@@ -1269,9 +1277,15 @@ def test_window_rounding_attempted(win, qapp):
     mode = getattr(win, "_round_mode", None)
     if os.name != "nt":
         pytest.skip("圆角是 Windows 上的事")
-    assert mode in ("dwm", "rgn", "none"), "圆角方式没有记录下来：%r" % (mode,)
-    from app.ui import acrylic
-    assert hasattr(acrylic, "set_round_corners"), "少了 DWM 圆角接口"
+    assert mode in ("continuous", "dwm")
+    if mode == "continuous":
+        assert not win.mask().isEmpty()
+        assert not win.mask().contains(win.rect().topLeft())
+        assert win.mask().contains(win.rect().center())
+    else:
+        assert win.mask().isEmpty()
+        assert win.glass_mode.startswith("sca-")
+    assert win.centralWidget().outline_mode == mode
 
 
 def test_rounded_dialog_buttons_and_radius(qapp):
@@ -1530,13 +1544,7 @@ def test_glass_panels_do_not_overlap_and_preview_is_largest(qapp):
 
 
 def test_window_surface_has_no_fully_transparent_pixels(qapp):
-    """窗口表面不能出现 alpha=0 的像素。
-
-    毛玻璃用的是**分层窗口**（WA_TranslucentBackground），而 Windows 对分层窗口的
-    鼠标命中是**按像素 alpha 判定**的：alpha=0 的地方会被当成"这里没东西"，
-    点击直接穿透到后面的窗口 —— 用户实测过"能透过软件界面点到后面的东西"。
-    所以窗口底色那层"几乎看不见的白雾"是不能删的，这条测试守住它。
-    """
+    """连续曲率轮廓内部不能有透明穿孔；轮廓以外的裁边允许透明。"""
     from app.ui.main_window import MainWindow
 
     w = MainWindow(SpecLibrary.load())
@@ -1545,9 +1553,21 @@ def test_window_surface_has_no_fully_transparent_pixels(qapp):
         w.show()
         qapp.processEvents()
         img = w.grab().toImage()
+        from PySide6.QtCore import QPoint
+        mask = w.mask()
+        if w._round_mode == "dwm":
+            from PySide6.QtCore import QRectF
+            from PySide6.QtGui import QPainterPath, QRegion
+            from app.ui import chrome
+            outline = QPainterPath()
+            outline.addRoundedRect(QRectF(w.rect()), chrome.RADIUS, chrome.RADIUS)
+            mask = QRegion(outline.toFillPolygon().toPolygon())
+        assert not mask.isEmpty()
         holes = []
         for y in range(0, img.height(), 13):
             for x in range(0, img.width(), 13):
+                if not mask.contains(QPoint(x, y)):
+                    continue
                 if img.pixelColor(x, y).alpha() == 0:
                     holes.append((x, y))
         assert not holes, (

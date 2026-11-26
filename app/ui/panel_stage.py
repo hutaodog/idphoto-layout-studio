@@ -19,6 +19,7 @@ from PySide6.QtCore import QRect
 from PySide6.QtWidgets import QWidget
 
 from .glass_panel import GlassPanel
+from .corners import remove_surface
 
 # 卡片再挤也不能小于这个尺寸。别调太小：这些卡片内容都很密
 # （6 个滑块 / 规格列表 / 7 个色块），压到 160×110 会截得看不清。
@@ -35,6 +36,8 @@ Slot = Tuple[str, Tuple[float, float, float, float], int, int]
 def strip_group(gb) -> QWidget:
     """去掉分组卡片自带的标题带与白底 —— 玻璃卡片本身就是卡片。"""
     gb.setTitle("")
+    gb.setProperty("continuousCorners", False)
+    remove_surface(gb)
     gb.setStyleSheet(
         "QGroupBox{background:transparent;border:none;margin-top:2px;}"
         "QGroupBox::title{height:0px;}")

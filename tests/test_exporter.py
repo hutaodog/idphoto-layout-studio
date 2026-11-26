@@ -6,9 +6,13 @@
 所以「144×192px 且 ≥20KB」根本无法靠降质量达成，必须合法填充。
 """
 import os
+import struct
+import zlib
 
 import numpy as np
 import pytest
+from PIL import Image
+from PIL.TiffImagePlugin import IFDRational
 
 from app.core.exporter import (printed_mm, read_dpi, resample_to_dpi,
                                save_image)
@@ -120,10 +124,39 @@ def test_dpi_survives_compression_and_padding():
     assert os.path.getsize(p) >= 60 * 1024
 
 
+@pytest.mark.parametrize("deficit", [1, 3, 11, 12, 13, 27, 28, 65538])
+def test_png_padding_is_valid_with_tiny_deficit(tmp_path, deficit):
+    """Validate every CRC and chunk position, including deficits below 12 bytes."""
+    from app.core.exporter import _encode, _png_pad
+
+    img = np.full((12, 13, 3), 90, np.uint8)
+    data = _encode(img, "png", 300)
+    padded, amount = _png_pad(data, len(data) + deficit)
+    assert amount == max(12, deficit)
+    assert padded[-12:] == data[-12:]  # original IEND stays last
+    chunks = _png_chunks(padded)
+    assert chunks[-1] == (b"IEND", b"")
+    kind, payload = chunks[-2]
+    if deficit < 28:
+        assert kind == b"paDd" and payload == bytes(max(12, deficit) - 12)
+    else:
+        assert kind == b"tEXt"
+        assert payload.count(b"\x00") == 1
+        assert payload.startswith(b"idphoto-padding\x00")
+    path = tmp_path / "tiny.png"
+    path.write_bytes(padded)
+    with Image.open(path) as im:
+        im.verify()
+    with Image.open(path) as im:
+        im.load()
+        assert im.size == (13, 12)
+        assert im.info["dpi"] == pytest.approx((300, 300), abs=0.5)
+
+
 def test_png_export_keeps_alpha_and_dpi():
     img = np.zeros((413, 295, 4), np.uint8)
     img[:, :, 0] = 200
-    img[:, :, 3] = 255
+    img[:, :, 3] = np.linspace(0, 255, 295, dtype=np.uint8)
     p = os.path.join(OUT_DIR, "alpha.png")
     rep = save_image(img, p, dpi=300, fmt="png")
     assert os.path.exists(p)
@@ -131,6 +164,7 @@ def test_png_export_keeps_alpha_and_dpi():
     from PIL import Image
     with Image.open(p) as im:
         assert im.mode == "RGBA"
+        assert np.array_equal(np.asarray(im), img[:, :, [2, 1, 0, 3]])
 
 
 def test_chinese_path_roundtrip():
@@ -147,3 +181,139 @@ def test_reports_failure_when_limit_impossible():
     rep = save_image(_img(2000, 2000, seed=6), p, dpi=300, max_kb=5)
     assert rep.fits_limits is False
     assert rep.messages
+
+
+def _png_chunks(data):
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    chunks = []
+    offset = 8
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        end = offset + 12 + length
+        assert end <= len(data)
+        kind = data[offset + 4:offset + 8]
+        payload = data[offset + 8:offset + 8 + length]
+        crc = struct.unpack(">I", data[end - 4:end])[0]
+        assert crc == zlib.crc32(kind + payload) & 0xffffffff
+        chunks.append((kind, payload))
+        offset = end
+        if kind == b"IEND":
+            assert offset == len(data), "padding must precede IEND"
+    assert offset == len(data)
+    return chunks
+
+
+@pytest.mark.parametrize("suffix", ["jpg", "png"])
+def test_encoded_dpi_metadata_matches_pillow_and_raw_headers(tmp_path, suffix):
+    path = tmp_path / "nested" / "中文" / ("metadata." + suffix)
+    rep = save_image(_img(24, 36), path, dpi=350)
+    assert rep.ok() and rep.dpi_written == rep.dpi_readback == (350, 350)
+    with Image.open(path) as im:
+        im.load()
+        assert im.info["dpi"] == pytest.approx((350, 350), abs=0.02)
+        if suffix == "jpg":
+            assert im.info["jfif_unit"] == 1
+            assert im.info["jfif_density"] == (350, 350)
+            exif = im.getexif()
+            assert (float(exif[282]), float(exif[283]), exif[296]) == (350, 350, 2)
+    if suffix == "png":
+        phys = dict(_png_chunks(path.read_bytes()))[b"pHYs"]
+        assert struct.unpack(">IIB", phys) == (round(350 / 0.0254),
+                                               round(350 / 0.0254), 1)
+
+
+@pytest.mark.parametrize("unit,x,y,expected", [
+    (2, IFDRational(1505, 4), IFDRational(1401, 4), (376, 350)),
+    (3, IFDRational(15000, 127), IFDRational(17500, 127), (300, 350)),
+])
+def test_read_dpi_uses_fractional_exif_over_default_jfif(tmp_path, unit, x, y, expected):
+    path = tmp_path / "external.jpg"
+    exif = Image.Exif()
+    exif[282], exif[283], exif[296] = x, y, unit
+    Image.new("RGB", (30, 20), "white").save(path, dpi=(72, 72), exif=exif)
+    with Image.open(path) as im:
+        assert im.info["jfif_density"] == (72, 72)
+    assert read_dpi(path) == expected
+
+
+def test_read_dpi_falls_back_to_jfif_without_exif(tmp_path):
+    path = tmp_path / "jfif_only.jpg"
+    Image.new("RGB", (30, 20)).save(path, dpi=(300, 350))
+    assert read_dpi(path) == (300, 350)
+
+
+def test_jpeg_composites_bgra_alpha_onto_white(tmp_path):
+    bgra = np.zeros((32, 96, 4), np.uint8)
+    bgra[:, 32:64] = (0, 0, 200, 128)
+    bgra[:, 64:] = (0, 0, 200, 255)
+    path = tmp_path / "alpha.jpg"
+    assert save_image(bgra, path).ok()
+    with Image.open(path) as im:
+        pixels = np.asarray(im)
+        assert im.mode == "RGB"
+    assert pixels[16, 16] == pytest.approx((255, 255, 255), abs=2)
+    assert pixels[16, 48] == pytest.approx((227, 127, 127), abs=3)
+    assert pixels[16, 80] == pytest.approx((200, 0, 0), abs=3)
+
+
+@pytest.mark.parametrize("deficit", [1, 4, 65538, 65539, 65540, 131078])
+def test_jpeg_padding_uses_valid_com_segments_before_eoi(tmp_path, deficit):
+    from app.core.exporter import _encode, _jpeg_pad
+
+    data = _encode(np.full((8, 9, 3), 90, np.uint8), "jpg", 300)
+    padded, amount = _jpeg_pad(data, len(data) + deficit)
+    assert amount == max(4, deficit)
+    offset = len(data) - 2
+    assert padded[:offset] == data[:-2]
+    while offset < len(padded) - 2:
+        assert padded[offset:offset + 2] == b"\xff\xfe"
+        length = struct.unpack(">H", padded[offset + 2:offset + 4])[0]
+        assert 2 <= length <= 65535
+        offset += 2 + length
+    assert offset == len(padded) - 2 and padded[offset:] == b"\xff\xd9"
+    path = tmp_path / "padded.jpg"
+    path.write_bytes(padded)
+    with Image.open(path) as im:
+        im.load()
+        assert im.size == (9, 8)
+    assert read_dpi(path) == (300, 300)
+
+
+def test_png_tiny_padding_cannot_claim_impossible_exact_range(tmp_path):
+    from app.core.exporter import _encode
+
+    image = np.full((8, 9, 3), 90, np.uint8)
+    limit = (len(_encode(image, "png", 300)) + 1) / 1024
+    report = save_image(image, tmp_path / "limited.png", min_kb=limit, max_kb=limit)
+    assert report.padded_bytes == 12
+    assert not report.fits_limits and not report.ok()
+    assert any("上限" in message for message in report.messages)
+
+
+def test_single_image_uses_stricter_target_and_spec_maximum(tmp_path):
+    image = _img(295, 413, seed=21)
+    for target, maximum in ((80, 24), (24, 80)):
+        report = save_image(image, tmp_path / ("limit_%d.jpg" % target),
+                            target_kb=target, max_kb=maximum, min_kb=20)
+        assert 20 * 1024 <= report.bytes <= 24 * 1024
+        assert report.ok()
+
+
+@pytest.mark.parametrize("suffix,options", [
+    ("bmp", {}), ("jpg", {"fmt": "gif"}), ("jpg", {"fmt": ""}),
+    ("jpg", {"fmt": 123}), ("jpg", {"max_kb": -1}),
+    ("jpg", {"target_kb": 0}), ("jpg", {"min_kb": -1}),
+    ("jpg", {"max_kb": float("nan")}), ("jpg", {"max_kb": float("inf")}),
+    ("jpg", {"min_kb": float("nan")}), ("jpg", {"min_kb": float("inf")}),
+    ("jpg", {"max_kb": 1e308}),
+    ("jpg", {"target_kb": "20"}), ("jpg", {"max_kb": True}),
+    ("jpg", {"min_kb": 21, "max_kb": 20}),
+    ("jpg", {"min_kb": 21, "target_kb": 20}),
+    ("jpg", {"dpi": 0}), ("jpg", {"dpi": 300.5}), ("jpg", {"dpi": 65536}),
+    ("jpg", {"quality": 0}), ("jpg", {"quality": 101}),
+])
+def test_export_rejects_invalid_format_and_limits_before_writing(tmp_path, suffix, options):
+    path = tmp_path / "must_not_be_created" / ("bad." + suffix)
+    with pytest.raises(ValueError):
+        save_image(np.zeros((8, 8, 3), np.uint8), path, **options)
+    assert not path.parent.exists()

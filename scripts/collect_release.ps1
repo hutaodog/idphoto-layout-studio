@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Continue'
 # Then verifies every copy by SHA256 against the exact source it came from.
 #
 # Rules that matter:
-#   - wipe the destination first, so an old version's artifacts never linger
+#   - remove only old application binaries; preserve exported photos and user settings
 #   - each target name comes from exactly ONE source (docs live in the project root,
 #     binaries live in dist) -- copying the same name twice makes the hash check lie
 
@@ -34,29 +34,36 @@ $instLeaf = if ($instFile) { $instFile.Name } else { "*_v${ver}.exe" }
 $outName = [string]([char]0x6210 + [char]0x54C1 + [char]0x8F6F + [char]0x4EF6)
 $out     = Join-Path $root $outName
 
-# usage doc / plan doc / readme note
+# Public usage documentation only; never collect internal planning files.
 $docUsage = [string]([char]0x4F7F + [char]0x7528 + [char]0x8BF4 + [char]0x660E) + '.md'
-$docPlan  = [string]([char]0x8BA1 + [char]0x5212 + [char]0x4E66) + '.md'
 $readme   = [string]([char]0x5148 + [char]0x8BFB + [char]0x6211) + '.txt'
 
 New-Item -ItemType Directory -Force -Path $out | Out-Null
-Get-ChildItem $out -Recurse -Force -ErrorAction SilentlyContinue |
-  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+$appBase = [string]([char]0x8BC1 + [char]0x4EF6 + [char]0x7167 + [char]0x6392 + [char]0x7248 + [char]0x52A9 + [char]0x624B)
+Get-ChildItem $out -File -Force -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -eq ($appBase + '.exe') -or
+                 $_.Name -like ($appBase + '_*.exe') -or
+                 $_.Name -like ($appBase + '_portable_*.zip') } |
+  Remove-Item -Force -ErrorAction SilentlyContinue
 
 # (source, target filename) -- docs come from the project root, binaries from dist.
 # Exclude same-named doc copies from dist: copying one file twice makes the\n# SHA256 check report a false MISMATCH.
-$docNames = @($docUsage, 'README.md', $docPlan) | ForEach-Object { Split-Path $_ -Leaf }
+$publicDocs = @($docUsage, 'README.md', 'CHANGELOG.md', 'NOTICE.md', 'LICENSE',
+                'docs\vendor-patches.md', 'docs\research\photo-size-sources.md',
+                'docs\validation-v1.6.7.md', 'docs\validation-v1.6.12.md', 'screenshots\v1.6.7-layout.png',
+                'screenshots\v1.6.7-original.png', 'screenshots\v1.6.12-options.png',
+                 'screenshots\v1.6.12-motion.gif')
 $plan = @()
 Get-ChildItem $dist -File -ErrorAction SilentlyContinue |
-  Where-Object { $docNames -notcontains $_.Name } |
+  Where-Object { $_.Extension -in @('.exe', '.zip') } |
   # Only collect the CURRENT version: a leftover zip/installer from a previous version
   # in dist\ would otherwise be copied too, and nobody could tell which one to ship.
   # (package_release.ps1 clears them first, but running this script alone must hold too.)
   Where-Object { $_.Name -notmatch '_v\d+\.\d+\.\d+' -or $_.Name -like "*_v${ver}.*" } |
   ForEach-Object { $plan += , @($_.FullName, $_.Name) }
-foreach ($d in @($docUsage, 'README.md', $docPlan)) {
+foreach ($d in $publicDocs) {
   $src = Join-Path $root $d
-  if (Test-Path -LiteralPath $src) { $plan += , @($src, (Split-Path $d -Leaf)) }
+  if (Test-Path -LiteralPath $src) { $plan += , @($src, $d) }
 }
 
 Write-Host "=== copying -> $out ==="
@@ -64,6 +71,7 @@ $locked = @()
 foreach ($pair in $plan) {
   $dest = Join-Path $out $pair[1]
   try {
+    New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
     Copy-Item -LiteralPath $pair[0] -Destination $dest -Force -ErrorAction Stop
     Write-Host ("   {0,-46} {1,8:N1} MB" -f $pair[1], ((Get-Item -LiteralPath $pair[0]).Length / 1MB))
   } catch {
@@ -101,7 +109,7 @@ $L += [string]([char]0x4E09 + [char]0x4E2A + [char]0x7248 + [char]0x672C + [char
 $L += ''
 $L += '1) ' + [string]([char]0x643A + [char]0x5E26 + [char]0x7248 + [char]0x00B7 + [char]0x6587 + [char]0x4EF6 + [char]0x5939 + [char]0xFF08 + [char]0x63A8 + [char]0x8350 + [char]0xFF09)
 $L += '   ' + [string]([char]0x89E3 + [char]0x538B) + " *_portable_v${ver}.zip " + [string]([char]0x5230 + [char]0x4EFB + [char]0x610F + [char]0x4F4D + [char]0x7F6E + [char]0xFF0C)
-$L += '   ' + [string]([char]0x53CC + [char]0x51FB + [char]0x91CC + [char]0x9762 + [char]0x7684) + ' exe ' + [string]([char]0x5373 + [char]0x7528 + [char]0x3002 + [char]0x79D2 + [char]0x5F00 + [char]0x3002)
+$L += '   ' + [string]([char]0x53CC + [char]0x51FB + [char]0x91CC + [char]0x9762 + [char]0x7684) + ' exe ' + [string]([char]0x5373 + [char]0x7528 + [char]0x3002)
 $L += ''
 $L += '2) ' + [string]([char]0x643A + [char]0x5E26 + [char]0x7248 + [char]0x00B7 + [char]0x5355 + [char]0x6587 + [char]0x4EF6)
 $L += '   ' + [string]([char]0x5C31 + [char]0x4E00 + [char]0x4E2A) + ' exe' + [string]([char]0xFF0C + [char]0x62F7 + [char]0x5230 + [char]0x54EA + [char]0x90FD + [char]0x80FD + [char]0x8DD1 + [char]0x3002)
@@ -109,8 +117,9 @@ $L += ''
 $L += '3) ' + [string]([char]0x5B89 + [char]0x88C5 + [char]0x7248)
 $L += '   ' + [string]([char]0x53CC + [char]0x51FB) + " $instLeaf " + [string]([char]0x5B89 + [char]0x88C5 + [char]0xFF0C + [char]0x5F00 + [char]0x59CB + [char]0x83DC + [char]0x5355 + [char]0x542F + [char]0x52A8 + [char]0x3002)
 $L += ''
-$L += [string]([char]0x4E09 + [char]0x4E2A + [char]0x90FD + [char]0x4E0D + [char]0x9700 + [char]0x8981 + [char]0x88C5) + ' Python' + [string]([char]0x3001 + [char]0x4E0D + [char]0x9700 + [char]0x8981 + [char]0x8054 + [char]0x7F51 + [char]0x3001 + [char]0x4E0D + [char]0x9700 + [char]0x8981 + [char]0x663E + [char]0x5361 + [char]0x3002)
+$L += [string]([char]0x4E09 + [char]0x4E2A + [char]0x90FD + [char]0x4E0D + [char]0x9700 + [char]0x8981 + [char]0x88C5) + ' Python' + [string]([char]0x3001 + [char]0x4E0D + [char]0x9700 + [char]0x8981 + [char]0x663E + [char]0x5361 + [char]0x3002)
 $L += [string]([char]0x7167 + [char]0x7247 + [char]0x4E0D + [char]0x4F1A + [char]0x4E0A + [char]0x4F20 + [char]0x5230 + [char]0x4EFB + [char]0x4F55 + [char]0x5730 + [char]0x65B9 + [char]0x3002)
+$L += 'Network is used for updates and missing-model downloads. See README.md for limits.'
 $L += ''
 $L += [string]([char]0x8BE6 + [char]0x7EC6 + [char]0x7528 + [char]0x6CD5 + [char]0x89C1 + [char]0xFF1A) + $docUsage
 [IO.File]::WriteAllLines($notePath, $L, (New-Object Text.UTF8Encoding $false))

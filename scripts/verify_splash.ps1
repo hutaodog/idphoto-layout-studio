@@ -176,7 +176,7 @@ function Test-Gui([string]$exe, [string]$tag) {
   foreach ($d in $left) { Write-Host ("    {0}" -f $d.FullName) }
   Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
 
-  $ok = $winSeen -and (-not $tkSeen) -and ($tkLeft -eq 0) -and ($left.Count -eq 0)
+  $ok = $winSeen -and $closed -and (-not $tkSeen) -and ($tkLeft -eq 0) -and ($left.Count -eq 0)
   Write-Host ("VERDICT {0} = {1}" -f $tag, $ok)
   return [pscustomobject]@{ Artifact = $tag; Seconds = $winAt; Ok = $ok }
 }
@@ -195,6 +195,6 @@ $verdicts = @($verdicts | Where-Object { $_ -ne $null })
 Write-Host ""
 Write-Host "=========== SUMMARY ==========="
 $verdicts | Format-Table -AutoSize
-$all = (($verdicts | Where-Object { -not $_.Ok }).Count -eq 0) -and $verdicts.Count -gt 0
+$all = (($verdicts | Where-Object { -not $_.Ok }).Count -eq 0) -and ($verdicts.Count -eq 2)
 Write-Host ("GUI CHECK PASS = {0}" -f $all)
 if (-not $all) { exit 1 }

@@ -19,8 +19,9 @@ from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QVBoxLayout, QWidget)
 
 from . import style
+from .corners import continuous_path
 
-RADIUS = 14          # 卡片圆角
+RADIUS = style.PANEL_RADIUS          # 卡片连续圆角
 EDGE = 7             # 边缘感应宽度（用来拉伸）
 TITLE_H = 32         # 标题行高度（也是拖动区）
 
@@ -84,8 +85,8 @@ class GlassPanel(QWidget):
         p.setPen(Qt.NoPen)
         for grow, alpha in ((5, 16), (2, 26)):
             p.setBrush(QColor(12, 18, 32, alpha))
-            p.drawRoundedRect(r.adjusted(-grow, -grow + 1, grow, grow + 1),
-                              RADIUS + grow, RADIUS + grow)
+            p.drawPath(continuous_path(r.adjusted(-grow, -grow + 1, grow, grow + 1),
+                                       RADIUS + grow))
 
         # 玻璃本体：竖向渐变
         g = QLinearGradient(r.topLeft(), r.bottomLeft())
@@ -94,7 +95,7 @@ class GlassPanel(QWidget):
         g.setColorAt(1.0, QColor(*GLASS_BOT))
         p.setBrush(QBrush(g))
         p.setPen(QPen(QColor(*GLASS_BORDER), 1))
-        p.drawRoundedRect(r, RADIUS, RADIUS)
+        p.drawPath(continuous_path(r, RADIUS))
 
         # 顶部高光：贴着上边缘的一条亮线（iOS 玻璃的标志），两端随圆角淡出
         p.setPen(QPen(QColor(*GLASS_HILITE), 1))

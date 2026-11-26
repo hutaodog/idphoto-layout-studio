@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-"""用户设置（持久化到程序目录下的 `settings.json`，**不碰 C 盘**）。
+"""用户设置（优先写程序目录下的 `settings.json`，不可写时使用日志目录）。
 
-目前只有两件事：
+持久化项目：
 * `out_dir` —— 用户自定义的输出目录。选过一次之后**重启也记得**；
   目录被删掉/不可写时自动退回默认（程序目录下的「输出」），不会卡在坏路径上。
 * `update_sources` —— 自定义更新源（静态 `update.json` 的 URL 列表）。
   和 GitHub 一起参与测速，谁的延迟低用谁（见 `core/updater.py`）。
 
-为方便手改，文件是缩进过的 UTF-8 JSON；写失败不抛异常（设置丢了不该让程序起不来）。
+* `preserve_original_background` —— 是否保留原照片底色。
+
+文件为 UTF-8 JSON。读失败使用默认值；写失败抛出异常，由界面提示本次设置未保存。
 """
 from __future__ import annotations
 
 import json
 import os
+import tempfile
 from typing import Any, Dict, List
 
 # 默认的自定义更新源：把 update.json 和更新包放到这个目录即可参与测速。
@@ -25,12 +28,13 @@ DEFAULT_UPDATE_SOURCES: List[str] = [
 DEFAULTS: Dict[str, Any] = {
     "out_dir": "",
     "update_sources": list(DEFAULT_UPDATE_SOURCES),
+    "preserve_original_background": False,
 }
 
 
 def _base_dir() -> str:
     """设置文件放哪：程序目录；不可写就退到日志目录（paths.log_dir 会兜底）。"""
-    from .paths import app_dir, log_dir
+    from ..paths import app_dir, log_dir
     d = app_dir()
     try:
         probe = os.path.join(d, ".w_settings")
@@ -60,17 +64,32 @@ def load() -> Dict[str, Any]:
     if not isinstance(data.get("update_sources"), list):
         data["update_sources"] = list(DEFAULT_UPDATE_SOURCES)
     data["update_sources"] = [str(u) for u in data["update_sources"] if str(u).strip()]
+    value = data.get("preserve_original_background", False)
+    data["preserve_original_background"] = value if isinstance(value, bool) else False
     return data
 
 
 def save(**kw) -> Dict[str, Any]:
+    """合并并原子写入设置；写失败必须抛出，让界面如实提示用户。"""
     data = load()
     data.update({k: v for k, v in kw.items() if k in DEFAULTS})
+    target = settings_path()
+    parent = os.path.dirname(os.path.abspath(target))
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".json", dir=parent)
     try:
-        with open(settings_path(), "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:                                      # noqa: BLE001
-        pass
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return data
 
 

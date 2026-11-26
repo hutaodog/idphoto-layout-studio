@@ -75,7 +75,7 @@ function Test-Artifact([string]$name, [string]$exe, [string]$tag, [string]$workD
   # system drive", a false failure. Something the app really writes is measured in
   # MBs (and the onefile build unpacks ~300 MB if it ever hit %TEMP%).
   $cGrew = ($cAfter - $cBefore -lt -8)     # more than 8 MB consumed on C: = real
-  $pass = $ok -and ($jpg.Count -ge 2) -and (-not $cGrew)
+  $pass = ($code -eq 0) -and $ok -and ([bool]$obj.frozen) -and ($jpg.Count -ge 2) -and (-not $cGrew)
   Write-Host ("VERDICT {0} = {1}   (jpg={2}, wrote C:={3})" -f $name, $pass, $jpg.Count, $cGrew)
   return $pass
 }
@@ -109,6 +109,6 @@ if ($od) {
 Write-Host ""
 Write-Host "=========== SUMMARY ==========="
 $verdicts | Format-Table -AutoSize
-$allOk = (($verdicts | Where-Object { -not $_.Ok }).Count -eq 0)
+$allOk = ($verdicts.Count -eq 2) -and (($verdicts | Where-Object { -not $_.Ok }).Count -eq 0)
 Write-Host ("ALL ARTIFACTS PASS = {0}" -f $allOk)
 if (-not $allOk) { exit 1 }

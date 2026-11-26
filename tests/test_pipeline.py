@@ -11,7 +11,7 @@ import pytest
 
 from app.core.exporter import printed_mm, read_dpi, save_image
 from app.core.io_compat import imread, imwrite
-from app.core.layout import plan_layout, render_layout
+from app.core.layout import plan_for_spec, render_layout
 from app.core.pipeline import ManualTransform, Processor, PipelineError, load_photo
 from app.core.specs import SpecLibrary
 
@@ -135,7 +135,7 @@ def test_end_to_end_export_and_layout(proc, lib, demo_img):
     w_mm, h_mm = printed_mm(single_path)
     assert abs(w_mm - 25.0) < 0.15 and abs(h_mm - 35.0) < 0.15
 
-    plan = plan_layout(paper.px_at(300), spec.px_size, dpi=300)
+    plan = plan_for_spec(paper, spec, dpi=300)
     assert plan.count == 12, plan.count
     canvas = render_layout(res.standard_bgr, plan, crop_line="cross")
     layout_path = os.path.join(OUT_DIR, "02_e2e_layout_6inch.jpg")
@@ -164,3 +164,21 @@ def test_missing_weights_message_is_actionable(monkeypatch):
 def test_load_photo_reports_bad_path():
     with pytest.raises(PipelineError):
         load_photo(os.path.join(OUT_DIR, "definitely_missing.jpg"))
+
+
+def test_real_model_retains_source_for_both_background_modes(proc, lib, demo_img):
+    from dataclasses import replace
+    spec = lib.photo("cn_yicun")
+    normal = proc.process(demo_img, spec, bg="red")
+    original = replace(normal, preserve_original=True)
+    assert normal.original_bgr.shape[:2] == normal.matting_bgra.shape[:2]
+    np.testing.assert_array_equal(proc.recompose(original, "blue"), normal.original_standard)
+    assert normal.original_standard.shape == (*spec.hw, 3)
+    assert not np.array_equal(normal.standard_bgr, normal.original_standard)
+    # An unsegmented source canvas survives automatic and manual paths.
+    manual = proc.recrop(original, ManualTransform(rotate=5, offset_y=.12))
+    assert manual.shape == (*spec.hw, 3)
+    assert not np.array_equal(manual, normal.original_standard)
+    direct = proc.process(demo_img, spec, bg="blue", preserve_original=True)
+    np.testing.assert_array_equal(direct.standard_bgr, direct.original_standard)
+    np.testing.assert_array_equal(direct.standard_bgr, normal.original_standard)

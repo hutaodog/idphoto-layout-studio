@@ -10,21 +10,43 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
 import time
+from dataclasses import replace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.core.exporter import printed_mm, save_image          # noqa: E402
+from app.core.exporter import printed_mm, save_image             # noqa: E402
 from app.core.layout import (DEFAULT_GAP_MM, DEFAULT_MARGIN_MM,  # noqa: E402
-                             plan_layout, render_layout, smallest_paper_for)
+                             plan_for_spec, render_layout, smallest_paper_for)
 from app.core.pipeline import (ManualTransform, PipelineError,  # noqa: E402
                                Processor, load_photo)
 from app.core.specs import SpecLibrary                          # noqa: E402
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("必须是正整数")
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("必须是有限非负数")
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("必须是有限非负数")
+    return parsed
 
 
 def safe_stem(path: str) -> str:
@@ -54,14 +76,15 @@ def cmd_list_papers(lib: SpecLibrary, args) -> int:
 
 def cmd_plan(lib: SpecLibrary, args) -> int:
     spec = lib.photo(args.spec)
+    dpi = args.dpi or spec.dpi
     papers = [lib.paper(args.paper)] if args.paper else lib.papers
     for paper in papers:
-        plan = plan_layout(paper.px_at(300), spec.px_size, dpi=300,
-                           gap_mm=args.gap, margin_mm=args.margin, paper_id=paper.id)
+        plan = plan_for_spec(paper, spec, dpi=dpi,
+                             gap_mm=args.gap, margin_mm=args.margin)
         print("  %-14s %s" % (paper.name_zh, plan.summary()))
     if args.count:
-        best = smallest_paper_for(args.count, spec.px_size, lib.papers,
-                                  gap_mm=args.gap, margin_mm=args.margin)
+        best = smallest_paper_for(args.count, spec.px_at(dpi), lib.papers,
+                                  dpi=dpi, gap_mm=args.gap, margin_mm=args.margin)
         if best:
             print("\n  要排 %d 张，最小可用相纸：%s（可排 %d 张）"
                   % (args.count, best.paper_id, best.count))
@@ -76,8 +99,7 @@ def cmd_run(lib: SpecLibrary, args) -> int:
 
     spec = lib.photo(args.spec)
     if args.dpi:
-        spec = type(spec)(**{**spec.__dict__, "dpi": args.dpi,
-                             "px": spec.px_at(args.dpi)})
+        spec = replace(spec, dpi=args.dpi, px=spec.px_at(args.dpi))
     paper = lib.paper(args.paper)
 
     t0 = time.time()
@@ -86,7 +108,8 @@ def cmd_run(lib: SpecLibrary, args) -> int:
 
     proc = Processor(lib=lib)
     res = proc.process(img, spec, bg=args.bg, hollow_fix=not args.no_hollow_fix,
-                       face_alignment=args.face_alignment)
+                       face_alignment=args.face_alignment,
+                       preserve_original=args.keep_background)
     print("内核：%.3fs  人脸框=%s" % (time.time() - t0, res.face_rect))
 
     if args.adjust:
@@ -98,11 +121,13 @@ def cmd_run(lib: SpecLibrary, args) -> int:
         print("已应用手动微调：%s" % t.as_dict())
 
     stem = safe_stem(args.input)
-    tag = "%s_%s_%s" % (stem, spec.id, args.bg)
+    tag = "%s_%s_%s" % (stem, spec.id,
+                           "original" if args.keep_background else args.bg)
 
     single = os.path.join(out_dir, "%s.jpg" % tag)
-    rep = save_image(res.standard_bgr, single, dpi=spec.dpi,
-                     target_kb=args.kb, max_kb=spec.kb_limits[1],
+    output_dpi = spec.dpi
+    rep = save_image(res.standard_bgr, single, dpi=output_dpi,
+                     target_kb=args.kb or None, max_kb=spec.kb_limits[1],
                      min_kb=spec.kb_limits[0])
     mm = printed_mm(single)
     print("\n证件照  %s" % single)
@@ -117,23 +142,30 @@ def cmd_run(lib: SpecLibrary, args) -> int:
         print("  ！导出未满足约束（dpi 或大小）")
 
     if args.no_layout:
-        return 0
+        return 0 if rep.ok() else 2
 
-    plan = plan_layout(paper.px_at(300), spec.px_size, dpi=300,
-                       gap_mm=args.gap, margin_mm=args.margin, paper_id=paper.id)
+    plan = plan_for_spec(paper, spec, gap_mm=args.gap, margin_mm=args.margin,
+                         dpi=output_dpi)
     if plan.is_empty:
         print("\n！%s 上排不下 %s" % (paper.name_zh, spec.name_zh))
         return 2
     canvas = render_layout(res.standard_bgr, plan, crop_line=args.crop_line)
     layout_path = os.path.join(out_dir, "%s_%s排版.jpg" % (tag, paper.id))
-    rep2 = save_image(canvas, layout_path, dpi=300, max_kb=args.layout_max_kb)
+    rep2 = save_image(canvas, layout_path, dpi=output_dpi,
+                      max_kb=args.layout_max_kb or None)
     mm2 = printed_mm(layout_path)
     print("\n排版照  %s" % layout_path)
     print("  %s" % plan.summary())
-    print("  %.1fKB  按该 dpi 打印尺寸：%.0f×%.0fmm（标称 %.0f×%.0fmm）"
-          % (rep2.kb, mm2[0], mm2[1], paper.mm[0], paper.mm[1]))
+    print("  %.1fKB  dpi回读=%s" % (rep2.kb, rep2.dpi_readback))
+    if mm2:
+        print("  按该 dpi 打印尺寸：%.0f×%.0fmm（标称 %.0f×%.0fmm）"
+              % (mm2[0], mm2[1], paper.mm[0], paper.mm[1]))
+    for message in rep2.messages:
+        print("  注意：%s" % message)
+    if not rep2.ok():
+        print("  ！排版导出未满足约束（dpi 或大小）")
     print("\n总耗时 %.2fs" % (time.time() - t0))
-    return 0
+    return 0 if rep.ok() and rep2.ok() else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -145,21 +177,29 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--bg", "-b", default="white", help="底色 id（默认 white）")
     ap.add_argument("--paper", "-p", default="6inch", help="相纸 id（默认 6inch）")
     ap.add_argument("--out", "-o", default="output", help="输出目录")
-    ap.add_argument("--dpi", type=int, default=0, help="覆盖导出 dpi（默认用规格自带值）")
-    ap.add_argument("--kb", type=float, default=0, help="目标文件大小上限 KB")
-    ap.add_argument("--gap", type=float, default=DEFAULT_GAP_MM, help="照片间距 mm（默认 2）")
-    ap.add_argument("--margin", type=float, default=DEFAULT_MARGIN_MM, help="纸张留边 mm（默认 3）")
+    ap.add_argument("--dpi", type=_positive_int, default=0,
+                    help="覆盖导出 dpi（默认用规格自带值）")
+    ap.add_argument("--kb", type=_nonnegative_float, default=0,
+                    help="目标文件大小上限 KB（0 表示不限）")
+    ap.add_argument("--gap", type=_nonnegative_float, default=DEFAULT_GAP_MM,
+                    help="照片间距 mm（默认 2）")
+    ap.add_argument("--margin", type=_nonnegative_float, default=DEFAULT_MARGIN_MM,
+                    help="纸张留边 mm（默认 3）")
     ap.add_argument("--crop-line", default="cross", choices=["none", "cross", "box"],
                     help="裁剪线样式（默认 cross 贯穿式）")
-    ap.add_argument("--layout-max-kb", type=float, default=0, help="排版照大小上限 KB")
+    ap.add_argument("--layout-max-kb", type=_nonnegative_float, default=0,
+                    help="排版照大小上限 KB（0 表示不限）")
     ap.add_argument("--adjust", default="", help="手动微调，如 zoom=1.2,offset_y=0.05,rotate=3")
     ap.add_argument("--no-layout", action="store_true", help="只出证件照，不出版照")
     ap.add_argument("--no-hollow-fix", action="store_true", help="关闭抠图内部空洞修补")
     ap.add_argument("--face-alignment", action="store_true", help="开启人脸矫正")
+    ap.add_argument("--keep-background", action="store_true",
+                    help="保留输入照片的原底色，而不是替换为 --bg")
     ap.add_argument("--list-specs", action="store_true", help="列出全部规格")
     ap.add_argument("--list-papers", action="store_true", help="列出相纸与底色")
     ap.add_argument("--plan", action="store_true", help="只算排版张数，不出图")
-    ap.add_argument("--count", type=int, default=0, help="配合 --plan：反算最小相纸")
+    ap.add_argument("--count", type=_positive_int, default=0,
+                    help="配合 --plan：反算最小相纸")
     ap.add_argument("--verbose", "-v", action="store_true")
     return ap
 
@@ -169,16 +209,16 @@ def main(argv=None) -> int:
     lib = SpecLibrary.load()
     lib.require()
 
-    if args.list_specs:
-        return cmd_list_specs(lib, args)
-    if args.list_papers:
-        return cmd_list_papers(lib, args)
-    if args.plan:
-        return cmd_plan(lib, args)
-    if not args.input:
-        build_parser().print_help()
-        return 1
     try:
+        if args.list_specs:
+            return cmd_list_specs(lib, args)
+        if args.list_papers:
+            return cmd_list_papers(lib, args)
+        if args.plan:
+            return cmd_plan(lib, args)
+        if not args.input:
+            build_parser().print_help()
+            return 1
         return cmd_run(lib, args)
     except PipelineError as e:
         print("\n处理失败：%s" % e, file=sys.stderr)
@@ -186,6 +226,9 @@ def main(argv=None) -> int:
     except KeyError as e:
         print("\n规格/底色不存在：%s" % e, file=sys.stderr)
         return 4
+    except ValueError as e:
+        print("\n参数无效：%s" % e, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

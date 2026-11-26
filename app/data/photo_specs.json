@@ -1,34 +1,46 @@
 {
   "version": 1,
-  "updated": "2026-10-15",
+  "updated": "2026-11-20",
   "rules": [
-    "mm 为宽×高（打印口径），px 为宽×高（像素口径），dpi 是每条规格的独立字段——禁止当成全局常量 300。",
-    "上传像素与打印毫米是两套口径（例如 NCRE 要求最小 192×144px 且成像区 48×33mm），两组值都保留，永不互相换算。",
-    "px 一律等于 round(mm/25.4*dpi)；报名系统强制指定像素时，把 mm 反算成与该像素自洽的值。",
-    "**同一个物理尺寸只保留一条规格**（用户反馈：「把什么一寸、二寸、三寸的，就留一个正常用的那个」）：不同 dpi 的变体合并（dpi 在「输出设置」里选），同名不同用途的证件（驾照/社保卡/护照…）合并成别名，靠 aliases 仍然搜得到。",
-    "同名不同义的历史口径（二寸曾有 35×53 与 37×49 两种）只留主流一条，另一条要么删、要么明确标注；因此用 (用途, 来源) 区分，并为每条保留 source 与 confidence。"
+    "mm 和 px 均按宽×高记录。dpi 是每条规格的独立字段，按其实际口径使用。",
+    "打印预设的 px 按 round(mm/25.4*dpi) 计算。数字上传预设按像素反算的兼容排版毫米用 mm_from_px 标记，适用要求见 note 和 refs.scope。尺寸自洽只验证换算关系。",
+    "「中国常用」同一个物理尺寸只保留一条通用预设。不同 dpi 在输出设置里选，同尺寸的常用名称通过 aliases 搜索。",
+    "一寸、二寸、三寸按业务口径和毫米尺寸辨识。二寸的 35×53 与 35×49 均有特定业务实例。source 为摘要，refs 为已核来源的 title、issuer、url、scope 和 verified。同一政策的转载只作同一份证据。"
   ],
   "confidence_levels": {
-    "A": "官方页面原文核实",
-    "B": "两个以上成熟开源实现一致，且与 mm→px@dpi 数学自洽",
-    "C": "单一实现或行业惯例",
-    "D": "未核实，需实测"
+    "A": "官方原文支持注明业务和时期内的具体要求",
+    "B": "不同开源实现或参考资料的口径一致",
+    "C": "单一实现或非官方服务惯例",
+    "D": "依据不足或适用范围未核实，需受理方确认"
   },
   "compose_default": { "head_measure_ratio": 0.2, "head_height_ratio": 0.45, "head_top_range": [0.12, 0.1] },
   "specs": [
     { "id": "cn_xiaoyicun", "name_zh": "小一寸", "aliases": ["小1寸", "驾驶证", "驾照", "电子驾驶证", "电子驾照"], "category": "中国常用", "mm": [22, 32], "dpi": 300, "px": [260, 378], "bg": ["white", "blue"], "note": "驾驶证、电子驾驶证同尺寸；交管上传通常要求 14~30KB", "source": "LiYing size_zh.csv（驾驶证同值）", "confidence": "B" },
-    { "id": "cn_yicun", "name_zh": "一寸", "aliases": ["1寸", "one inch", "简历照", "求职照"], "category": "中国常用", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white", "blue", "red"], "note": "简历照/求职照同尺寸", "source": "LiYing 与 Hivision 一致", "confidence": "B" },
+    { "id": "cn_yicun", "name_zh": "一寸", "aliases": ["1寸", "one inch", "简历照", "求职照", "25x35", "25×35"], "category": "中国常用", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white", "blue", "red"], "note": "南通人社公布的全国专业技术人员资格考试平台要求新注册考生使用25×35mm、295×413px白底照，并通过官方照片审核处理工具。其他用途的尺寸和底色请以受理方要求为准。", "source": "南通市人社局考试中心（专业技术人员资格考试平台新注册）", "confidence": "A", "refs": [
+      { "title": "报名电子照片要求", "issuer": "南通市人力资源和社会保障局考试中心", "url": "https://rsj.nantong.gov.cn/ntsrsj/wsbm/content/72322e10-36ff-49bf-96ca-caa790733644.html", "scope": "2024-12-30发布。全国专业技术人员资格考试报名服务平台自2018年起的新注册考生使用近期彩色免冠正面1寸25×35mm、295×413px白底照片，须使用照片审核处理工具。300dpi为本库默认，简历照等名称用于搜索。", "verified": "2026-11-20" }
+    ] },
     { "id": "cn_dayicun", "name_zh": "大一寸", "aliases": ["大1寸", "小二寸", "小2寸", "中国护照", "护照", "港澳通行证", "台湾通行证"], "category": "中国常用", "mm": [33, 48], "dpi": 300, "px": [390, 567], "bg": ["white", "blue"], "note": "护照、港澳/台湾通行证、小二寸都是这个尺寸", "source": "LiYing 与 Hivision 一致（护照/通行证同值）", "confidence": "B" },
-    { "id": "cn_ercun", "name_zh": "二寸", "aliases": ["2寸", "大二寸", "大2寸"], "category": "中国常用", "mm": [35, 53], "dpi": 300, "px": [413, 626], "bg": ["white", "blue"], "note": "另有 35×49 口径（部分照相馆叫二寸，本库单列为「简历照（宽版）」）", "source": "LiYing 主行，Hivision 同值", "confidence": "B" },
-    { "id": "cn_sancun", "name_zh": "三寸", "aliases": ["3寸"], "category": "中国常用", "mm": [55, 84], "dpi": 300, "px": [650, 992], "bg": ["white", "blue"], "source": "行业惯例；资料中的 649×991 与 55×84mm 不自洽，此处按 mm 换算取 650×992", "confidence": "D" },
+    { "id": "cn_ercun", "name_zh": "二寸（35×53mm）", "aliases": ["2寸", "大二寸", "大2寸", "35x53", "35×53"], "category": "中国常用", "mm": [35, 53], "dpi": 300, "px": [413, 626], "bg": ["white", "blue"], "note": "2026年度魔方运动一级裁判员注册要求半年内白底彩照，JPG或PNG且不大于2M。此处413×626px为300dpi换算。二寸另有35×49mm口径，请按受理方尺寸选用。", "source": "国家体育总局棋牌中心（2026年度魔方运动一级裁判员注册）", "confidence": "A", "refs": [
+      { "title": "体育总局棋牌中心关于开展2026年度魔方运动一级裁判员注册的通知", "issuer": "国家体育总局棋牌运动管理中心", "url": "https://www.sport.gov.cn/qpzx/n5384/c29458981/content.html", "scope": "2026-03-04发布，注册截至03-17。该年度一级裁判员上传二寸35×53mm半年内免冠白底彩照，JPG或PNG，文件不大于2M。原文未指定像素或DPI。", "verified": "2026-11-20" },
+      { "title": "请问办理结婚登记须提供几寸照片？", "issuer": "南京市人民政府门户网站", "url": "https://www.nanjing.gov.cn/hdjl/hygq/202307/t20230703_3951934.html", "scope": "2023-07-03答复。结婚登记交3张二寸3.5×5.3cm近期半身免冠合影，同一底版、单一底色。原文未注明宽高顺序，双人合影另有构图要求。", "verified": "2026-11-20" }
+    ] },
+    { "id": "cn_sancun", "name_zh": "三寸", "aliases": ["3寸", "55x84", "55×84"], "category": "中国常用", "mm": [55, 84], "dpi": 300, "px": [650, 992], "bg": ["white", "blue"], "note": "55×84mm来自商业证件照服务。650×992px为300dpi换算；用于办理业务前请向受理方确认尺寸。", "source": "改图宝、数码相片回执（商业服务尺寸参考）", "confidence": "D", "refs": [
+      { "title": "常见照片尺寸规格表", "issuer": "改图宝", "url": "https://www.gaitubao.com/wiki/1328.html", "scope": "2023-01-31发布。商业页上方证件照表列三寸55×84mm、300dpi时650×992px，同页下方常规照片表却列3英寸50×72mm。55×84mm仅有此处的商业尺寸表支持。", "verified": "2026-11-20" },
+      { "title": "三寸照片尺寸大小", "issuer": "数码相片回执（xtukj.com）", "url": "https://www.xtukj.com/shan/7586.html", "scope": "页面标注2024-12-16。商业小程序介绍称三寸为55×84mm，未提供任何官方受理要求。", "verified": "2026-11-20" }
+    ] },
     { "id": "cn_5inch_life", "name_zh": "五寸生活照", "aliases": ["5寸生活照"], "category": "中国常用", "mm": [89, 127], "dpi": 300, "px": [1051, 1500], "bg": ["white", "blue", "red", "darkblue", "lightgray", "black"], "source": "LiYing（3R 标准）", "confidence": "B" },
     { "id": "cn_idcard", "name_zh": "身份证", "aliases": ["居民身份证", "社保卡", "社会保障卡", "居住证"], "category": "中国常用", "mm": [26, 32], "dpi": 350, "px": [358, 441], "bg": ["white"], "note": "社保卡、居住证同尺寸；社保卡上传通常要求 9~20KB", "source": "LiYing 显式标注 350dpi；Hivision 同像素但错标 300dpi", "confidence": "B" },
     { "id": "cn_marriage", "name_zh": "结婚证照", "aliases": ["结婚照"], "category": "中国常用", "mm": [53, 35], "dpi": 300, "px": [626, 413], "bg": ["red"], "source": "LiYing 色表 + 行业惯例；民政部规范未抓到", "confidence": "D" },
-    { "id": "cn_resume_wide", "name_zh": "简历照（宽版）", "aliases": ["求职照宽版", "35x49", "35×49", "二寸宽版"], "category": "中国常用", "mm": [35, 49], "dpi": 300, "px": [413, 579], "bg": ["white", "blue"], "note": "35×49mm 口径——部分照相馆把它叫「二寸」（本库二寸取 35×53）", "source": "行业惯例；另有 25×35 口径", "confidence": "C" },
+    { "id": "cn_resume_wide", "name_zh": "二寸（35×49mm）", "aliases": ["简历照（宽版）", "求职照宽版", "35x49", "35×49", "二寸宽版", "2寸35x49"], "category": "中国常用", "mm": [35, 49], "dpi": 300, "px": [413, 579], "bg": ["white", "blue"], "note": "湘桥区2023年发布的2022年广东中医医术确有专长医师资格考核通知，师承方式申报材料要求6张近期二寸约35×49mm白底照，仅支持该业务实例。413×579px为本库300dpi换算；简历照（宽版）为旧版别名，不能代表所有简历或医师资格业务。", "source": "湘桥区卫健局（2023年发布的中医医术确有专长医师资格考核通知）", "confidence": "A", "refs": [
+      { "title": "关于开展广东省中医医术确有专长人员医师资格考核报名工作的通知", "issuer": "潮州市湘桥区卫生健康局", "url": "https://www.xiangqiao.gov.cn/zwgk/gsgg/content/post_3835550.html", "scope": "2023-03-02发文、03-03刊载。第三项（二）11：2022年广东中医医术确有专长医师资格考核、以师承方式学习中医的申报材料交6张近期二寸（约3.5cm*4.9cm）正面免冠白底彩色证件照；不是所有医师资格或简历的通用要求，未给DPI、像素或文件大小。", "verified": "2026-11-20" }
+    ] },
     { "id": "cn_degree", "name_zh": "学位照 / 毕业图像采集", "aliases": ["毕业照采集"], "category": "中国常用", "mm": [40.6, 54.1], "dpi": 300, "px": [480, 639], "bg": ["blue"], "source": "行业惯例", "confidence": "D" },
 
     { "id": "exam_cpta", "name_zh": "中国人事考试网（一建/执业药师/消防）", "aliases": ["人事考试"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "formats": ["jpg"] }, "note": "必须用官方照片审核处理工具（Photoprocess.exe）审核后才能上传", "source": "cpta.com.cn 官方", "confidence": "A" },
-    { "id": "exam_ncre", "name_zh": "全国计算机等级考试 NCRE", "aliases": ["计算机等级"], "category": "考试报名", "mm": [16.26, 12.19], "dpi": 300, "px": [192, 144], "bg": ["white", "lightgray"], "compose": { "head_measure_ratio": 0.2, "head_height_ratio": 0.5, "head_top_range": [0.1, 0.1] }, "upload": { "min_kb": 20, "max_kb": 200, "formats": ["jpg"] }, "note": "官方口径：最小 192×144px 且成像区不小于 48×33mm；头占 7/10、肩占 1/5、上空 1/10、左右各空 1/10；禁用生活照与美颜照", "source": "sdzk.cn 转发教育部考试院", "confidence": "A" },
+    { "id": "exam_ncre", "name_zh": "全国计算机等级考试 NCRE（2022北京像素口径）", "aliases": ["计算机等级", "NCRE"], "category": "考试报名", "mm": [12.19, 16.26], "mm_from_px": true, "dpi": 300, "px": [144, 192], "bg": ["white", "lightgray"], "compose": { "head_measure_ratio": 0.2, "head_height_ratio": 0.5, "head_top_range": [0.1, 0.1] }, "upload": { "min_kb": 20, "max_kb": 200, "formats": ["jpg"] }, "note": "2022北京原文最小192×144（高×宽），本库为宽144×高192。12.19×16.26mm仅按300dpi反算兼容打印，非官方实体尺寸；底色为应用选项。2026北京页面改写为192mm×144mm，单位存在冲突，未自行判定笔误；须以当期考区通知和报名系统为准。", "source": "北京教育考试院2022简章；2026同院页面存在单位冲突", "confidence": "A", "refs": [
+      { "title": "北京市2022年9月全国计算机等级考试报考简章", "issuer": "北京教育考试院", "url": "https://www.bjeea.cn/html/fxlks/ncre/2022/0620/82024.html", "scope": "2022-06-20。像素高宽比4:3、最小192×144（高×宽）；JPEG .jpg、20–200KB。支持本预设宽144高192的历史像素下限，不给毫米或DPI，未在此条规定底色。", "verified": "2026-11-20" },
+      { "title": "2026年9月北京地区全国计算机等级考试报考简章", "issuer": "北京教育考试院", "url": "https://www.bjeea.cn/html/fxlks/ncre/tongzhigonggao/2026/0617/88220.html", "scope": "2026-06-18页面。第四项4把最小图像写为192mm×144mm（高×宽），另写成像区48mm×33mm（高×宽），与2022像素单位冲突。保留冲突证据，不自行认定笔误或将两份要求拼接；JPEG20–200KB不变。", "verified": "2026-11-20" }
+    ] },
     { "id": "exam_ntce", "name_zh": "中小学教师资格考试 NTCE", "aliases": ["教资"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "max_kb": 200, "formats": ["jpg"] }, "note": "免冠、正面、彩色，白底", "source": "ntce.neea.edu.cn 官方", "confidence": "A" },
     { "id": "exam_nurse", "name_zh": "护士执业资格考试", "aliases": ["护士资格"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "min_kb": 20, "max_kb": 45, "formats": ["jpg"] }, "note": "必须用官方照片审核处理工具处理后上传", "source": "21wecan.com 官方", "confidence": "A" },
     { "id": "exam_yz", "name_zh": "研究生考试（研招网）", "aliases": ["考研"], "category": "考试报名", "mm": [25, 35], "dpi": 300, "px": [295, 413], "bg": ["white"], "upload": { "formats": ["jpg"] }, "note": "官方改为学信网 App 在线拍照并做图像质检，推荐他人用后置摄像头；强行美化会被报考点退回", "source": "yz.chsi.com.cn 官方（白底与质检要求已核）", "confidence": "A" },

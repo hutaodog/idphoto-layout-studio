@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QProgressBa
 from ..core import updater
 from .. import __version__
 from . import style
+from .corners import apply_surface
 from .update_worker import UpdateDownloadWorker, describe_sources
 
 
@@ -101,6 +102,8 @@ class UpdateDialog(QDialog):
         self.txt.setStyleSheet(
             "QTextBrowser{background:#fafbfc;border:1px solid %s;border-radius:8px;"
             "color:%s;font-size:12px;padding:8px;}" % (style.BORDER, style.MUTED_STRONG))
+        apply_surface(self.txt, "#fafbfc", style.BORDER, 8)
+        self.txt.viewport().setAutoFillBackground(False)
         notes = (info.notes or "").strip() or "（这个版本没有写更新说明）"
         try:
             self.txt.setMarkdown(notes)          # Qt 5.14+ / 6.x 都支持
@@ -153,6 +156,8 @@ class UpdateDialog(QDialog):
         self.btn_go.clicked.connect(self._on_go)
         btns.addWidget(self.btn_go)
         v.addLayout(btns)
+
+        style.install_continuous_style()
 
         if auto_check:
             self.lbl_progress.setVisible(True)

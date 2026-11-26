@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import threading
@@ -52,12 +53,15 @@ class ManualTransform:
 
 @dataclass
 class ProcessResult:
-    standard_bgr: np.ndarray        # 成品证件照（已合成底色）；bg 为空时是 RGBA
-    standard_rgba: np.ndarray       # 内核直出的裁剪结果（未合成底色），换底色时复用它，不必重跑模型
+    standard_bgr: np.ndarray        # 当前成品（通常为 BGR；保留原底色时也是 BGR）
+    standard_rgba: np.ndarray       # 内核直出的透明裁剪结果，换底色时复用
     matting_bgra: np.ndarray        # 全幅抠图，供手动微调
     face: Optional[dict]
     spec: PhotoSpec
     bg: Optional[str]
+    original_bgr: Optional[np.ndarray] = None  # 与 matting 同坐标系的完整源图
+    original_standard: Optional[np.ndarray] = None  # 自动构图后的源图版本
+    preserve_original: bool = False
 
     @property
     def size(self) -> Tuple[int, int]:
@@ -75,48 +79,101 @@ class ProcessResult:
         return tuple(int(v) for v in r[:4])
 
 
-def _rect_sub_pix(img: np.ndarray, size, center):
-    """cv2.getRectSubPix 只支持 1/3 通道，4 通道要拆开分别取再合并。"""
-    import cv2
-    if img.ndim == 2 or img.shape[2] in (1, 3):
-        return cv2.getRectSubPix(img, size, center)
-    return cv2.merge([cv2.getRectSubPix(c, size, center) for c in cv2.split(img)])
+def _warp_crop_to_size(img: np.ndarray, width: int, height: int,
+                       center: Tuple[float, float], crop_size: Tuple[float, float],
+                       rotate: float = 0.0) -> np.ndarray:
+    """直接把任意裁剪框采样到目标尺寸，不创建巨大中间裁剪图。
 
-
-def crop_to_spec(matting_bgra: np.ndarray, spec: PhotoSpec, face_rect, t: ManualTransform,
-                 bg_bgr: Tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
-    """按手动参数从全幅抠图里重新裁一张证件照（不重跑模型，毫秒级）。"""
+    ``getRectSubPix`` 的旧实现会先按缩放值申请完整裁剪框；当缩放滑块接近
+    0 时，几万像素的中间 BGRA 图可能占用数 GB。这里让 warpAffine 一次完成
+    旋转、裁剪和缩放，输出大小始终等于规格尺寸。
+    """
     import cv2
 
-    W, H = spec.px_size
-    img = matting_bgra
     if img is None or img.size == 0:
-        raise PipelineError("抠图结果为空，无法裁剪")
+        raise PipelineError("输入图像为空，无法裁剪")
+    cx, cy = float(center[0]), float(center[1])
+    crop_w = max(1.0, float(crop_size[0]))
+    crop_h = max(1.0, float(crop_size[1]))
+    if width <= 0 or height <= 0 or not all(
+            math.isfinite(v) for v in (cx, cy, crop_w, crop_h, rotate)):
+        raise PipelineError("裁剪参数必须是有限数值，输出尺寸必须大于零")
+    # 输出像素中心映射到源像素中心，整图等尺寸采样时保持逐像素一致。
+    left = cx - crop_w / 2.0 + crop_w / width / 2.0 - 0.5
+    top = cy - crop_h / 2.0 + crop_h / height / 2.0 - 0.5
+    sample = np.array([
+        [crop_w / float(width), 0.0, left],
+        [0.0, crop_h / float(height), top],
+    ], dtype=np.float64)
+    if abs(float(rotate)) > 0.01:
+        rot = cv2.getRotationMatrix2D((cx, cy), float(rotate), 1.0)
+        inv_rot = cv2.invertAffineTransform(rot)
+        sample = np.vstack([inv_rot, [0.0, 0.0, 1.0]]) @ np.vstack([sample, [0.0, 0.0, 1.0]])
+        sample = sample[:2]
+    flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+    return cv2.warpAffine(img, sample, (int(width), int(height)), flags=flags,
+                          borderMode=cv2.BORDER_REPLICATE)
 
+
+def _finite_parameter(value, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _crop_geometry(img: np.ndarray, face_rect, spec: PhotoSpec,
+                   t: ManualTransform) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """返回与预览一致的裁剪中心和尺寸。"""
     if face_rect is None:
         fh = img.shape[0] * 0.35
         cx, cy = img.shape[1] / 2.0, img.shape[0] * 0.35
     else:
         x, y, fw, fh = face_rect
         cx, cy = x + fw / 2.0, y + fh / 2.0
+    zoom = max(0.05, _finite_parameter(t.zoom, 1.0))
+    head_ratio = max(0.05, _finite_parameter(t.head_ratio, 0.55))
+    W, H = spec.px_size
+    win_h = max(8.0, float(fh) / head_ratio / zoom)
+    win_w = max(8.0, win_h * float(W) / float(H))
+    ccx = cx + _finite_parameter(t.offset_x, 0.0) * win_w
+    ccy = (cy + (0.5 - _finite_parameter(t.center_y, 0.42)) * win_h
+           + _finite_parameter(t.offset_y, 0.0) * win_h)
+    return (ccx, ccy), (win_w, win_h)
 
-    if abs(t.rotate) > 0.01:
-        M = cv2.getRotationMatrix2D((cx, cy), t.rotate, 1.0)
-        img = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
-                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-    win_h = max(8.0, fh / max(0.05, t.head_ratio) / max(0.05, t.zoom))
-    win_w = max(8.0, win_h * W / H)
+def crop_to_spec(matting_bgra: np.ndarray, spec: PhotoSpec, face_rect, t: ManualTransform,
+                 bg_bgr: Optional[Tuple[int, int, int]] = (255, 255, 255),
+                 source_bgr: Optional[np.ndarray] = None,
+                 preserve_original: bool = False) -> np.ndarray:
+    """从全幅结果重裁一张证件照；可选地对源图做同一套几何变换。
 
-    ccx = cx + t.offset_x * win_w
-    ccy = cy + (0.5 - t.center_y) * win_h + t.offset_y * win_h
+    原底色模式必须采样原始 BGR，而不是把透明抠图的 RGB 通道当成原图；
+    后者会把透明补边/黑色占位一起带进导出结果。
+    """
+    import cv2
 
-    patch = _rect_sub_pix(img, (int(round(win_w)), int(round(win_h))), (ccx, ccy))
-    patch = cv2.resize(patch, (W, H), interpolation=cv2.INTER_AREA)
+    if matting_bgra is None or matting_bgra.size == 0:
+        raise PipelineError("抠图结果为空，无法裁剪")
+    W, H = spec.px_size
+    center, crop_size = _crop_geometry(matting_bgra, face_rect, spec, t)
+    rotate = _finite_parameter(t.rotate, 0.0)
+    if preserve_original:
+        if source_bgr is None or source_bgr.ndim != 3 or source_bgr.shape[2] != 3 or source_bgr.size == 0:
+            raise PipelineError("原图数据为空，无法保留原底色")
+        if source_bgr.shape[:2] != matting_bgra.shape[:2]:
+            raise PipelineError("原图与抠图坐标尺寸不一致，无法保留原底色")
+        return _warp_crop_to_size(source_bgr, W, H, center, crop_size, rotate)
 
+    patch = _warp_crop_to_size(matting_bgra, W, H, center, crop_size, rotate)
+    if patch.ndim != 3 or patch.shape[2] != 4:
+        raise PipelineError("抠图裁切结果必须包含透明通道")
+    if bg_bgr is None:
+        return np.ascontiguousarray(patch)
     alpha = patch[:, :, 3:4].astype(np.float32) / 255.0
     rgb = patch[:, :, :3].astype(np.float32)
-    bg = np.array(bg_bgr, np.float32).reshape(1, 1, 3)
+    bg = np.asarray(bg_bgr, np.float32).reshape(1, 1, 3)
     out = rgb * alpha + bg * (1.0 - alpha)
     return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -184,7 +241,8 @@ class Processor:
     # ---------- 对外 ----------
     def process(self, image_bgr: np.ndarray, spec: PhotoSpec, bg: Optional[str] = "white",
                 hollow_fix: bool = True, face_alignment: bool = False,
-                beauty: Optional[Dict[str, int]] = None) -> ProcessResult:
+                beauty: Optional[Dict[str, int]] = None,
+                preserve_original: bool = False) -> ProcessResult:
         """跑一次完整流程：抠图 + 人脸检测 + 自动构图裁剪 + 换底色。约 0.3 秒（纯 CPU）。"""
         if image_bgr is None or image_bgr.size == 0:
             raise PipelineError("输入图片为空")
@@ -193,14 +251,17 @@ class Processor:
                 "抠图模型缺失：%s\n请先运行 scripts\\download_weights.ps1 或 app\\vendor\\build_vendor.py"
                 % self.weights_path())
 
-        os.environ["IDPHOTO_HOLLOW_FIX"] = "1" if hollow_fix else "0"
         compose = dict(self.lib.default_compose)
         compose.update(spec.compose or {})
         beauty = beauty or {}
 
-        creator = self._ensure_creator()
+        # 上游暂用环境变量读取空洞修补设置。初始化、设置、推理和恢复必须
+        # 共用一把锁，不能让另一个请求在推理中途改变此选项。
         with Processor._lock:
+            previous_hollow = os.environ.get("IDPHOTO_HOLLOW_FIX")
             try:
+                creator = self._ensure_creator()
+                os.environ["IDPHOTO_HOLLOW_FIX"] = "1" if hollow_fix else "0"
                 res = creator(
                     image_bgr,
                     size=spec.hw,
@@ -216,15 +277,27 @@ class Processor:
                 )
             except Exception as e:      # 内核的异常类型不稳定，统一转成 PipelineError
                 raise PipelineError("内核处理失败：%s" % e) from e
+            finally:
+                if previous_hollow is None:
+                    os.environ.pop("IDPHOTO_HOLLOW_FIX", None)
+                else:
+                    os.environ["IDPHOTO_HOLLOW_FIX"] = previous_hollow
 
-        standard_rgba = res.standard
-        standard = standard_rgba
-        if bg:
-            standard = self.compose(standard_rgba, bg)
+        standard_rgba = to_uint8(res.standard)
+        original_standard = getattr(res, "original_standard", None)
+        original_source = getattr(res, "original_source", None)
+        if preserve_original:
+            if original_standard is None or original_source is None:
+                raise PipelineError("内核未返回源图裁切数据，无法保留原底色")
+            standard = to_uint8(original_standard).copy()
+        else:
+            standard = self.compose(standard_rgba, bg) if bg else standard_rgba.copy()
 
         return ProcessResult(standard_bgr=standard, standard_rgba=standard_rgba,
-                             matting_bgra=res.matting, face=res.face,
-                             spec=spec, bg=bg)
+                             matting_bgra=to_uint8(res.matting), face=res.face,
+                             spec=spec, bg=bg, original_bgr=original_source,
+                             original_standard=original_standard,
+                             preserve_original=preserve_original)
 
     def compose(self, rgba_or_bgr: np.ndarray, bg: str) -> np.ndarray:
         """把抠图结果合成到指定底色上（毫秒级，换底色时用它，不重跑模型）。"""
@@ -237,9 +310,14 @@ class Processor:
                                            mode="pure_color"))
         return to_uint8(rgba_or_bgr)
 
-    def recompose(self, result: ProcessResult, bg: str) -> np.ndarray:
-        """换底色（不重跑模型）。手动微调过的结果请改用 recrop 重新裁。"""
-        return self.compose(result.standard_rgba, bg)
+    def recompose(self, result: ProcessResult, bg: Optional[str]) -> np.ndarray:
+        """恢复自动构图，并按当前模式渲染；不重跑模型。"""
+        if result.preserve_original:
+            if result.original_standard is None:
+                raise PipelineError("没有可恢复的原底色自动构图")
+            return result.original_standard.copy()
+        return (self.compose(result.standard_rgba, bg) if bg
+                else result.standard_rgba.copy())
 
     def recrop(self, result: ProcessResult, transform: ManualTransform,
                spec: Optional[PhotoSpec] = None) -> np.ndarray:
@@ -248,7 +326,10 @@ class Processor:
         bg_bgr = (255, 255, 255)
         if result.bg:
             bg_bgr = hex_to_bgr(self.lib.color(result.bg).hex)
-        return crop_to_spec(result.matting_bgra, spec, result.face_rect, transform, bg_bgr)
+        return crop_to_spec(result.matting_bgra, spec, result.face_rect, transform,
+                            bg_bgr if result.bg else None,
+                            source_bgr=result.original_bgr,
+                            preserve_original=result.preserve_original)
 
 
 def load_photo(path: str) -> np.ndarray:

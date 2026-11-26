@@ -1,228 +1,110 @@
 # 证件照排版助手
 
-> Windows 桌面证件照工具：**导入一张照片 → 自动抠图换底色 → 按证件照规格裁剪 → 排版到 5/6/7 寸相纸 → 导出可直接拿去冲印的文件。**
->
-> **照片全程在本机处理**，不会上传到任何地方；模型在本机 CPU 上推理，不写注册表。
-> 唯一会联网的地方是「检查更新」（只向 GitHub 取一个版本号），可在「帮助」菜单里关掉。
+Windows 桌面证件照工具：导入一张照片，选择尺寸与底色，自动或手动构图，再导出单张证件照和相纸排版。当前源码版本 **v1.6.12**。
 
-![工作台](screenshots/layout-preview.png)
+照片和人脸推理在本机处理，应用不上传照片。联网功能包括缺失模型下载、更新元数据查询及用户触发的更新包下载；关闭“启动时自动检查更新”只关闭自动查询，不会关闭其他联网操作。
 
-> 截图里的示例人像是**合成头像**（[`scripts/make_demo_face.py`](scripts/make_demo_face.py) 画的扁平插画），
-> 不含任何真人的形象；测试也用它当样例照片。
+![工作台：手动构图保留原底色](screenshots/v1.6.7-layout.png)
 
----
+涉及照片的截图和测试使用 `scripts/make_demo_face.py` 绘制的合成人像，不含真人示例照片。v1.6.12 的[原生下拉菜单截图](screenshots/v1.6.12-options.png)和[动画操作录制](screenshots/v1.6.12-motion.gif)另附，录制展示下拉、快速反向切换和任务进度。
 
-## 功能
+## 主要功能
 
-**自动抠图换底**
-- 人像抠图（MODNet）+ 人脸检测（MTCNN）在本机推理，CPU 约 1 秒/张
-- 底色：白 / 标准蓝 / 红 / 深蓝 / 浅灰 / 申根浅灰 / 黑，以及任意自定义颜色
-- 抠图内部空洞修补（发丝、肩膀半透明边）默认开启
+- **规整的选项与平顺动效**：寸数规格集中置顶，两种二寸相邻；卡片、下拉框、预览胶囊和进度反馈采用统一阻尼曲线，快速反向接续当前位置与速度，结束后停止动画。滚动到下部收起时保持上方标题稳定。
+- **可靠的下拉交互**：外部按钮和其他下拉框一次点击生效；关闭期间只确认一次选择，Esc取消后不会误提交。支持方向键、输入文字检索、Enter/Space确认、Esc/Alt+↑取消和Tab切换焦点，数据或所属控件变化时关闭过期菜单。
+- **进度反馈**：等待光带自动平滑往返，已知进度平滑到达最新值；按实际经过时间播放，隐藏、禁用或完成后停止计时。
+- **大连续圆角与胶囊**：控件、卡片及弹窗的连续曲率圆角加大；导出按钮、预览切换、滑条轨道、滚动条滑块和进度条保留半圆两端的胶囊，原有文字和控件尺寸保持。Windows亚克力窗口恢复实际生效的DWM系统圆角；系统不支持时关闭亚克力并使用32px连续曲线透明外轮廓。系统文件选择器及安装器外观由系统控制。
+- **保留导出结果**：界面文件名明确区分中文规格、尺寸与底色，同名自动编号；每次结果独立保存，导出后自动打开输出目录。
+- **一次一张**：新导入或拖入的照片替换上一张；处理期间仍可换图，只发布最新请求的结果。同一路径的文件再次导入也重新读取。
+- **换底或保留原底色**：可选白、蓝、红等预设与自定义颜色；勾选“保留原照片底色（不换底）”后，从原图对应区域取样，颜色按钮停用。开关、颜色和手动构图复用已完成的推理结果。
+- **构图**：自动构图、缩放、位置、旋转、脸部比例微调。切回自动会恢复自动结果。滚轮/拖动仅缩放和平移查看，Ctrl+拖动调整构图。
+- **排版**：5/6/7寸、A4、A3；纸张与照片统一按输出DPI从毫米换算；比较原方向及整体90°旋转网格，张数相同时优先原方向。不是混合方向装箱算法。
+- **裁切线**：贯穿线、独立方框或无；线位于照片边界，不在间距中线。旋转方案会真实旋转照片内容。
+- **导出**：JPEG/PNG；写入并回读DPI，改变输出DPI时同步改变像素。每张照片有像素量化误差，打印时仍需选择“实际尺寸”，关闭驱动缩放。
+- **文件大小约束**：单图按规格和用户上限编码；整版不继承单张报名文件的KB限制。无法满足约束会明确报告。PNG保留alpha，JPEG将alpha合成到白底；合法填充位于文件结束标记之前。
+- **设置**：输出目录和原底色开关持久化；写入失败会提示，采用同目录临时文件与原子替换保留已有配置。
 
-**规格库（40 条，每条都带来源与可信度）**
-- 常用：小一寸 22×32、一寸 25×35、大一寸 33×48、二寸 35×53、三寸 55×84、身份证 26×32、五寸生活照…
-- 护照签证：中国护照、港澳/台湾通行证、申根、美/日/韩/英/加/澳/新西兰…
-- 考试报名：人事考试网、教资 NTCE、护士、研招网、国考、四六级、JLPT…（带官方文件大小要求）
-- **一个物理尺寸只保留一条通用规格**；别的叫法（驾照、社保卡、小二寸、35×49…）放在**别名**里，搜索框照样搜得到
+“保留原底色”保留的是背景内容，不是原文件字节：仍会按尺寸裁剪、缩放，手动模式可旋转。管线保留归一化后的原图（长边最多2000像素）；超出原图边界的区域复制边缘像素。它仍需要人脸检测和模型，不是无需推理的直接裁图工具。
 
-**排版引擎（自研）**
-- 相纸：5 寸(3R) / 6 寸(4R) / 7 寸(5R) / A4 / A3，全部按真实毫米尺寸计算
-- 自动搜索「列 × 行」，并比较 90° 旋转后的方案，取张数最多的那种
-  （实测比上游 HivisionIDPhotos 写死 3 行的实现多排一倍：A4 上一寸 50 张 vs 21 张）
-- 照片间距、纸张留边、裁剪线（贯穿延长线 / 独立方框 / 不画）可调
-- 整块在纸面居中；导出时**每张照片的物理毫米尺寸永远等于规格尺寸**
+## 规格与来源
 
-**构图与预览**
-- 滑块微调：缩放、上下/左右位置、旋转 0.1°、人脸占高、脸部垂直位置
-- 预览：滚轮放大视图（1×~8×，以光标为锚点）、拖动平移视图；**Ctrl + 拖动** 才是挪照片构图
-- 把图片拖进窗口即可导入
+库中有40条照片预设，保留既有ID以兼容配置和CLI。来源等级只表示记录的证据类型，不保证当前业务受理。本轮重点复核如下：
 
-**导出**
-- dpi 逐张写入并**回读校验**（一寸 295×413px 若被标成 350dpi，打印出来会小 8.5%）
-- 报名系统的文件大小上下限：二分搜索 JPEG 质量；不足下限时用合法 COM 段填充（不是往文件里塞垃圾）
-- 换输出分辨率时像素跟着缩放，**打印尺寸恒定**（不会出现选 600dpi 打出来只有一半大的坑）
-- **自定义输出目录**：选一次就记住（存在 `settings.json`），重启还是它；目录不可用自动退回默认
-- 批量导入 / 批量导出；左列卡片摘要实时显示当前规格、底色、相纸张数、分辨率
+| 名称 | 宽×高毫米 | 300dpi宽×高像素 | 说明 |
+|---|---|---|---|
+| 一寸 | 25×35 | 295×413 | 专业技术资格考试平台的特定官方要求；还须使用其官方审核工具 |
+| 二寸（35×53mm） | 35×53 | 413×626 | 魔方裁判注册等业务；南京婚登也用此尺寸，但为双人合影 |
+| 二寸（35×49mm） | 35×49 | 413×579 | 湘桥区特定中医医师资格考核材料；旧名“简历照（宽版）”仍可搜索 |
+| 三寸 | 55×84 | 650×992 | 仅有商业服务参考，D级，未确认为通用官方标准 |
 
-**首次启动、自动更新都有独立进度窗**
+[完整来源、日期、业务范围与冲突记录](docs/research/photo-size-sources.md)。二寸的两种尺寸各自保留，不能只靠“寸名”选规格。NCRE改正为宽144×高192，名称注明2022北京像素口径；2026北京页面存在单位冲突，保留提示，不能作为当期合规保证。其他历史预设没有在本轮逐项重新联网核实。
 
-- 便携版/安装版不含模型：**双击后先弹出一个小窗下载模型**（进度条 + 速度 + 剩余），
-  下完自动打开程序，以后不再下载
-- 更新时点「下载并更新」→ 主界面关闭 → 小窗显示「正在更新到 vX」+ 更新说明 + 下载速度
-  → 「正在合并文件（N/M）」→ 「更新完成」→ 自动拉起新版本、小窗消失
+## 快速开始
 
-**自动更新**
-
-![检查更新](screenshots/update-dialog.png)
-
-- 启动后静默检查新版本（24 小时一次），发现更新会展示版本说明，点一下就下载并自动替换、
-  自动重启到新版本；不想更可以「以后再说」或「跳过这个版本」
-- **多源测速**：同时探测「GitHub」和自建节点（静态 `update.json`），**用延迟最低的那个下载**，
-  它失败了自动换下一个；对话框里会显示每个源的延迟
-- 下载走 GitHub（直连不通自动回退镜像）或自建节点；下载后按 `sha256` 校验
-- 可以在「帮助」菜单里关掉自动检查（关掉后程序完全不联网），`IDPHOTO_NO_UPDATE=1` 也能一票否决
-
-### 自建更新节点（国内下载更快）
-
-程序支持把更新包放在自己的服务器上，检查更新时和 GitHub 一起测速、谁快用谁。
-默认已经指向作者自己的节点，想换成自己的就这样：
+需要Windows 10/11及Python 3.11。界面的Win32效果只在Windows验证。
 
 ```powershell
-# 1. 打包（产出 成品软件\ 里的三个产物）
-.\scripts\package_release.ps1
-
-# 2. 生成节点需要的文件 → 成品软件\update\（update.json + 三个 ASCII 命名的包）
-.\.venv\Scripts\python.exe scripts\make_update_manifest.py --notes-file notes.md
-
-# 3. 推到服务器（SSH；默认用 ~/.ssh/id_ed25519 公钥，没有公钥才读 SSH_PASS 环境变量）
-.\.venv\Scripts\python.exe scripts\push_update_node.py --install-key
-.\.venv\Scripts\python.exe scripts\push_update_node.py
-
-# 4. 自检（脚本最后会自动做）：确认 <节点>/update.json 能匿名访问、版本号对得上
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-dev.txt
+# 源码仓库不含权重；首次使用前准备模型
+powershell -ExecutionPolicy Bypass -File scripts\download_weights.ps1
+.\.venv\Scripts\python.exe app\main.py
 ```
 
-`package_release.ps1` 默认在打包收尾时**自动执行 2~4 步**（`-SkipNode` 可跳过）。
+界面操作见[使用说明](使用说明.md)。三种打包形态为便携文件夹zip、安装包和单文件exe。当前打包配置包含MODNet模型；模型缺失时才需要下载引导。单文件版启动需解压运行库，通常比文件夹版慢，不承诺固定启动秒数。
 
-节点地址写在**程序目录**的 `settings.json` 里（可以写多个，每个都会参与测速）：
+CLI示例：
+
+```powershell
+.\.venv\Scripts\python.exe -m app.cli --plan --spec cn_yicun --paper 6inch --dpi 350
+.\.venv\Scripts\python.exe -m app.cli --input photo.jpg --spec cn_yicun --paper 6inch --keep-background --out 输出
+```
+
+单图大小上限用 `--kb`，整版独立用 `--layout-max-kb`。`--keep-background`接入同一原底色管线。
+
+## 测试与本地构建
+
+```powershell
+$env:QT_QPA_PLATFORM='offscreen'
+$env:IDPHOTO_NO_UPDATE='1'
+.\.venv\Scripts\python.exe -m pytest --basetemp=_tmp/pytest
+.\.venv\Scripts\python.exe scripts\audit_specs.py
+# 仅本地生成，避免构建过程向节点发布
+.\scripts\package_release.ps1 -SkipNode
+.\scripts\verify_build.ps1
+.\scripts\verify_splash.ps1
+.\scripts\verify_installer.ps1
+```
+
+回归覆盖真实QThread排队与旧结果丢弃、自动/手动恢复、原底色预览/导出一致、输出尺寸/裁线/旋转、格式/DPI/大小约束、中文路径与设置原子保存。部分生命周期测试用受控推理器隔离时序；另有实际MODNet合成人像测试。软件测试不能替代打印实测或报名受理审核。
+
+打包脚本清理旧版本产物，构建单文件与文件夹载荷，检查Qt插件/模型/规格库，生成zip及Inno安装包并收集校验。只带公开说明，不打包内部计划书。版本源为 `app/__init__.py`，安装器版本需同步。
+
+## 自动更新与节点
+
+程序保留GitHub、镜像及静态 `update.json` 节点更新功能。源选择比较的是元数据响应延迟，**不是完整下载吞吐量**。SHA256只在元数据提供摘要时校验；当前默认自建节点使用HTTP，不能视为签名更新。
 
 ```json
 { "update_sources": ["http://8.133.208.128/update/update.json"] }
 ```
 
-> 节点必须能**匿名**访问（云盘面板要登录的话不行，要用静态目录或直链）；
-> `update.json` 里是相对路径，整目录搬走不用改内容；
-> 包名必须以 `-portable.zip` / `-onefile.exe` / `-setup.exe` 结尾（程序按后缀挑包）。
+`package_release.ps1` 不带 `-SkipNode` 时会尝试生成清单并推送自建节点；不等于已同步GitHub，也不等于完成发布前验收。维护者应先用 `-SkipNode` 构建和验收，再明确发布。`make_update_manifest.py` 和 `push_update_node.py` 用于后续节点同步，SSH凭据不存入仓库。
 
----
+本轮只修复了关闭时等待线程、阻止晚到回调重开窗口，未重新实证受保护安装目录下的整套在线更新/UAC/中断回滚；不作无损回滚保证。下载时主界面隐藏，替换由独立合并进程执行。旧版1.6.3/1.6.4的参数缺陷可能需要手动安装跨过。
 
-## 快速开始（源码）
+## 目录与已知限制
 
-需要 **Windows 10/11 + Python 3.11**（界面用了 Win32 原生 API 做圆角与毛玻璃，只在 Windows 上验证过）。
+- `app/core/`：规格、排版、处理、编码、设置与更新逻辑；`app/ui/`：PySide6界面。
+- `app/vendor/hivision/`：Apache-2.0上游内核副本；[补丁记录](docs/vendor-patches.md)。
+- `tests/`：回归测试；`scripts/`：审计/打包/验收；`packaging/`：PyInstaller/Inno配置。
+- 默认输出和日志优先在程序目录；无写权限时部分目录回退用户路径，详见 `app/paths.py`。不承诺完全不写系统盘或注册表（安装器会登记卸载信息）。
+- 一次仅处理一个人脸；极端发丝、遮挡、透明头纱及原图边界不足可能影响效果。保留原底色不会修复原有背景瑕疵。
+- Windows资源管理器跨权限拖放、真实打印尺寸和外部报名系统审核仍需在实际环境确认。
 
-```powershell
-git clone <this-repo>
-cd 照片裁剪
+## 许可、用途与版本
 
-# 1. 虚拟环境（PySide6 只装 Essentials：完整版会多拖 170MB 的 WebEngine，本项目用不到）
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -U pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-dev.txt
+本项目自有代码采用[MIT](LICENSE)，第三方许可及用途说明见[NOTICE.md](NOTICE.md)。源码仓库不含模型权重与字体；构建载荷与源码仓库的分发范围不同。第三方组件包括HivisionIDPhotos、MODNet、MTCNN、PySide6/Qt、OpenCV、ONNX Runtime、Pillow和NumPy等。
 
-# 2. 抠图模型（约 25MB，走 GitHub 代理下载；仓库里不放二进制）
-powershell -ExecutionPolicy Bypass -File scripts\download_weights.ps1
+仅用于合法的证件照制作，不得用于伪造证件或身份冒用。规格不替代受理单位现行要求；软件按现状提供，不承诺审核通过、打印结果或特定用途适用性。
 
-# 3. 跑起来
-.\.venv\Scripts\python.exe app\main.py
-
-# 4. 跑测试（128 项，全程离线）
-$env:QT_QPA_PLATFORM='offscreen'; .\.venv\Scripts\python.exe -m pytest -q
-```
-
-> `QT_QPA_PLATFORM=offscreen` 必须加：否则 GUI 测试会真的把窗口弹出来。
-
-## 下载现成版本
-
-见 Releases：**便携版 zip**（解压即用、秒开，推荐）、**安装版**（Inno Setup）、**单文件 exe**
-（启动时要解压约 300MB，慢几秒）。
-
----
-
-## 打包自己的版本
-
-```powershell
-.\scripts\package_release.ps1                # 全量：图标 → 单文件 → 文件夹版 → zip → 安装包 → 收集
-.\scripts\package_release.ps1 -DocsOnly      # 只改了文档：重打 zip + 安装包
-```
-
-打包脚本**任一步失败立即中止**（否则会把上一次的产物当新的发出去）：
-清旧产物 → PyInstaller 双构建 → 载荷完整性断言（`qwindows.dll`、模型、规格库必须在包里）→
-Inno Setup → 收集到 `成品软件\` 并逐文件校验 SHA256。
-
-另有四个验收脚本：
-
-| 脚本 | 验什么 |
-|---|---|
-| `scripts\verify_build.ps1` | 清空 PATH + 代理指死端口下跑 `--selftest`：五步全过、出 2 张图、不写系统盘 |
-| `scripts\verify_splash.ps1` | 枚举**整组进程**的窗口，确认主窗口出现、干净退出、无 `_MEI*` 残留 |
-| `scripts\verify_installer.ps1` | 静默安装 → 对安装后的副本自检 → 静默卸载，目录/快捷方式/注册表全清 |
-| `scripts\collect_release.ps1` | 收集 + SHA256 校验（exe 被占用时自动另存为带版本号的名字） |
-
----
-
-## 目录结构
-
-```
-app/
-├─ core/            纯逻辑，不依赖 Qt
-│   ├─ specs.py         规格库（mm / px / dpi 三条铁律都写在这儿）
-│   ├─ layout.py        排版引擎（行列搜索 + 旋转择优 + 毫米↔像素口径统一）
-│   ├─ pipeline.py      抠图 → 换底 → 裁剪 → 构图微调
-│   └─ exporter.py      dpi 写入/回读、文件大小上下限、分辨率重采样
-├─ ui/              PySide6 界面
-│   ├─ main_window.py   主窗口（业务逻辑都在这儿）
-│   ├─ chrome.py        无边框圆角窗 + 标题栏 + WM_NCHITTEST
-│   ├─ acrylic.py       Windows 毛玻璃（SCA 亚克力）与 DWM 圆角
-│   ├─ preview.py       预览画布（视图缩放/平移）
-│   ├─ widgets.py       自绘控件（胶囊按钮、下拉箭头、对勾、防滚轮数字框）
-│   └─ layouts/         五套界面布局（默认 studio 工作台）
-├─ data/            规格库 JSON（photo_specs / paper_specs / bg_colors）
-├─ vendor/          上游内核（HivisionIDPhotos 的精简裁剪版，Apache-2.0）
-└─ paths.py         运行时可写目录（只在程序目录，不碰 C 盘）
-tests/              128 项 pytest（规格 / 排版 / 导出 / 界面）
-scripts/            打包与验收脚本
-packaging/          PyInstaller spec + Inno Setup 脚本
-docs/               第三方补丁说明
-```
-
----
-
-## 工程笔记（真踩过的坑，摘要）
-
-1. **PyInstaller 的静态分析看不见动态导入**：布局模块用 `importlib.import_module` 时源码全绿、打包版一启动就崩 → 现在一律静态 import，并在 spec 的 `hiddenimports` 里再列一遍。
-2. **分层窗口的鼠标命中按像素 alpha 判定**：`WA_TranslucentBackground` 下 alpha=0 的像素会被 Windows 当成"这里没有窗口"，点击直接穿到后面的程序 → 必须铺一层 alpha≈12 的白雾，并且铺满整个窗口矩形。
-3. **`SetWindowRgn` 不会裁分层窗口的合成画面**：圆角区域设了、`GetWindowRgn` 也查得到，画面照样是直角（亚克力按窗口矩形铺满）→ 圆角必须用 DWM 的 `DWMWA_WINDOW_CORNER_PREFERENCE`。
-4. **无边框窗口默认没有缩放热区**：Qt6 对 `FramelessWindowHint` 窗口的 `WM_NCHITTEST` 一律返回 `HTCLIENT`，边缘拖不动 → 自己拦 `WM_NCHITTEST` 返回 `HTLEFT/HTTOPLEFT…`（本项目按用户要求最终关掉了这个能力，开关在 `chrome.ALLOW_EDGE_RESIZE`）。
-5. **排版不能用两把尺子**：相纸按 300dpi 算像素、照片却用规格自带的 350dpi 像素，同一张 25×35mm 的照片会被当成 29.1×40.8mm，6 寸纸上从 12 张掉到 9 张 → 现在纸和照片统一按规格 dpi 由毫米换算。
-6. **QSS 用 `border` 拼三角形靠不住**：下拉箭头会渲染成小方块、数字框上下箭头会渲染成两个灰长方形 → 箭头一律用 `QPainter` 画。
-7. **`cv2.imread/imwrite` 在中文路径上静默失败**（返回 None / 什么也不写）→ 统一走 `np.fromfile + cv2.imdecode` / `imencode + tofile`。
-8. **微软雅黑缺一批符号字形**（`✔` `⚠` `ⓘ` `✕` 等）→ 界面上不许出现这些字符，箭头/勾叉全部自绘，并有一条测试用 `ast` 扫字符串字面量守着。
-9. **`.ps1` 里写中文会出怪事**（按 ANSI 解码把引号吃掉）→ 构建脚本一律 ASCII，并验证"非 ASCII 字节 = 0"。
-
----
-
-## 已知限制
-
-- 只支持 **Windows**（圆角、毛玻璃、缩放热区都调了 Win32 API）；macOS / Linux 未验证。
-- 一次处理**一个人脸**：多人合影会报 "Expected 1 face, but got 0/2"。
-- 抠图对**极端发丝、透明头纱**会留半透明边；可开"空洞修补"，但不保证完美。
-- 规格库是"证据集合"而非权威标准：每条都带 `source` 与 `confidence`
-  （A=官方页面核实 / B=多个成熟实现一致 / C=单一来源或行业惯例 / D=未核实）。
-  证件照标准各省各系统不一样，**以受理方要求为准**。
-
-## 第三方组件与许可
-
-本项目自己的代码用 **MIT**（见 [`LICENSE`](LICENSE)）；随仓库分发的上游组件保留各自许可（见 [`NOTICE.md`](NOTICE.md)）：
-
-| 组件 | 用途 | 许可 |
-|---|---|---|
-| [HivisionIDPhotos](https://github.com/Zeyi-Lin/HivisionIDPhotos) 的裁剪版内核 | 抠图 / 换底 / 构图管线 | Apache-2.0 |
-| MODNet（`hivision_modnet.onnx`） | 人像抠图模型 | Apache-2.0 |
-| MTCNN（`mtcnn-runtime`） | 人脸检测 | MIT |
-| PySide6 / Qt | 界面 | LGPL-3.0（动态链接） |
-| OpenCV / ONNX Runtime / Pillow / piexif / NumPy | 基础库 | 各自开源许可 |
-
-> 仓库里**不含**模型权重与字体（模型用 `scripts/download_weights.ps1` 下载）；
-> 上游自带的那个中文装饰字体不随仓库分发。
-
-## 免责声明
-
-- 本工具**仅供个人合法的证件照制作用途**：办理证件、报名考试、打印相纸等。
-- **禁止**用本工具制作、篡改用于伪造、变造证件或身份冒用的图像；因此产生的任何法律责任由使用者自负，作者不承担任何责任。
-- 人脸与照片数据**全部在本机处理**，除了「检查更新」以外程序不联网；检查更新只向 GitHub
-  取版本号，不上传照片、文件或任何个人信息，可在「帮助」菜单里关闭；请自行确认在本机处理他人照片的行为符合当地法律与当事人意愿。
-- 规格尺寸、报名系统的像素/文件大小要求整理自公开资料，**不作为官方依据**；提交前请以受理单位的现行要求为准。
-- 软件按"现状"提供，不承诺适用于任何特定目的；因使用造成的间接损失（如报名失败、打印废版）作者不承担责任。
-
-## 版本更新
-
-见 [CHANGELOG.md](CHANGELOG.md)；面向使用者的完整说明见 [使用说明.md](使用说明.md)。
+变更见[CHANGELOG.md](CHANGELOG.md)，本轮动画与下拉交互证据见[v1.6.12 验证记录](docs/validation-v1.6.12.md)；处理与规格重构证据见[v1.6.7 验证记录](docs/validation-v1.6.7.md)。

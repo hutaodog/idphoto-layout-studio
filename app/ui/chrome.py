@@ -27,8 +27,10 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizeGrip,
                                QSizePolicy, QVBoxLayout, QWidget)
 
 from . import style
+from .corners import apply_surface, continuous_path
 
-RADIUS = 12          # 窗口圆角（DWM 给圆角窗口的半径就在 8~12px 这档，画得跟它一致）
+RADIUS = 8           # DWM 系统外轮廓；与普通控件、卡片圆角分开
+WINDOW_RADIUS = 32   # 无系统亚克力时的连续曲率外轮廓
 MARGIN = 10          # 外圈留给阴影/缩放的宽度（这圈属于 Frame 自己，鼠标事件能收到）
 EDGE = 7             # 感应用的边缘宽度
 MENUBAR_H = 28       # 标题栏里菜单栏的固定高度（让它和标题文字居中对齐，见 attach_menubar）
@@ -312,8 +314,9 @@ class Frame(QWidget):
         super().__init__(parent)
         self._win = window
         self.glass = glass
-        self.backdrop = backdrop       # True = 系统亚克力（DWM 自己画模糊与圆角）
-        # 毛玻璃模式下窗口本身已经被 SetWindowRgn 裁成圆角（见 acrylic.apply_round_region），
+        self.backdrop = backdrop
+        self.outline_mode = "continuous"
+        # 毛玻璃模式下窗口本身已按 continuous_region 的统一路径裁切，
         # 外投影根本露不到窗口外面，所以留白收到 2px，让描边贴着窗口边。
         self.margin = 2 if glass else MARGIN
         self.setMouseTracking(True)
@@ -329,31 +332,31 @@ class Frame(QWidget):
     def paintEvent(self, e):                               # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        m = self.margin
-        r = QRectF(self.rect()).adjusted(m - 1, m - 1, -m + 1, -m + 1)
+        mode = self.outline_mode
+        radius = 0 if mode == "maximized" else (RADIUS if mode == "dwm" else WINDOW_RADIUS)
+        def outline(rect, corner):
+            if mode == "dwm":
+                path = QPainterPath()
+                path.addRoundedRect(rect, corner, corner)
+                return path
+            return continuous_path(rect, corner)
+        r = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
         if self.backdrop:
-            # 系统亚克力模式：DWM 负责模糊和圆角，这里**什么都不画**。
-            # 一旦画了底色，就会把那层模糊整个盖住（"灰不拉几"就是这么来的）。
             return
         if self.glass:
-            # ⚠ 这一层"几乎看不见的白雾"**不能去掉**，alpha 必须 > 0：
-            # 分层窗口（WA_TranslucentBackground）的鼠标命中是**按像素 alpha 判定**的，
-            # alpha=0 的像素会被 Windows 当成"这里没东西"，点击直接**穿透到后面的窗口**
-            # （用户实测"能透过软件界面点到后面的东西"）。顺带它也是那圈"玻璃板"的观感来源。
+            # Nonzero alpha prevents click-through across the visible surface.
             p.setBrush(QColor(255, 255, 255, 12))
             p.setPen(Qt.NoPen)
-            p.drawRect(self.rect())
-            # 圆角描边（圆角由 SetWindowRgn 在系统层裁好，这里只描边）
+            p.drawPath(outline(QRectF(self.rect()), radius))
             p.setBrush(Qt.NoBrush)
             p.setPen(QColor(255, 255, 255, 150))
         else:
             for i, a in ((7, 14), (4, 22), (2, 30)):
                 p.setBrush(QColor(10, 16, 30, a))
-                p.drawRoundedRect(r.adjusted(-i, -i + 1, i, i + 1),
-                                  RADIUS + i, RADIUS + i)
+                p.drawPath(outline(r.adjusted(-i, -i + 1, i, i + 1), radius + i))
             p.setBrush(QColor(self.BG))
             p.setPen(QColor(style.BORDER_STRONG))
-        p.drawRoundedRect(r, RADIUS, RADIUS)
+        p.drawPath(outline(r, max(0, radius - .5)))
 
     # ---- 八方向缩放（默认关掉，见文件头 ALLOW_EDGE_RESIZE 的说明）----
     def _edges_at(self, pos: QPoint) -> Qt.Edges:
@@ -416,7 +419,7 @@ def wrap(window: QWidget, title: str, version: str, toolbar: QWidget,
     v.setSpacing(0)
     bar = TitleBar(window, title, version)
     if glass:
-        # backdrop 模式圆角由 DWM 负责，这里就不要再加 border-radius（否则双圆角）
+        # backdrop 模式由窗口统一曲线路径裁切，各条带在窗口 mask 下保持满宽。
         radius_css = ("" if backdrop else
                       "border-top-left-radius:%dpx;border-top-right-radius:%dpx;"
                       % (RADIUS, RADIUS))
@@ -438,6 +441,16 @@ def wrap(window: QWidget, title: str, version: str, toolbar: QWidget,
         bar.setStyleSheet("QWidget#titleBar{background:%s;border-top-left-radius:%dpx;"
                           "border-top-right-radius:%dpx;}"
                           % (style.CARD, RADIUS, RADIUS))
+    if glass:
+        apply_surface(bar, QColor(255, 255, 255, 107), None, 0,
+                      border_width=0, corners=("top-left", "top-right"),
+                      edges={"bottom": QColor(255, 255, 255, 140)})
+        apply_surface(status, QColor(255, 255, 255, 87), None, 0,
+                      border_width=0, corners=("bottom-left", "bottom-right"),
+                      edges={"top": QColor(255, 255, 255, 115)})
+    else:
+        apply_surface(bar, style.CARD, None, RADIUS, border_width=0,
+                      corners=("top-left", "top-right"))
     v.addWidget(bar)
     v.addWidget(toolbar)
     v.addWidget(body, 1)

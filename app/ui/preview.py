@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
+
+from .corners import continuous_path
 
 
 def bgr_to_qimage(img: np.ndarray) -> QImage:
@@ -72,7 +74,7 @@ class PreviewCanvas(QWidget):
                         "按住 Ctrl 拖动 = 挪照片构图（也可以直接用「构图微调」的滑块）")
         # 中性浅灰：衬托白色相纸，同时比卡片底色略深一点点，边界看得出来
         self._bg = QColor("#e9ebef")
-        self.setStyleSheet("background:#e9ebef;border-radius:10px;")
+        self.setStyleSheet("background:transparent;")
 
     # ---------- 数据 ----------
     def set_image(self, img: Optional[np.ndarray], caption: str = "") -> None:
@@ -190,7 +192,10 @@ class PreviewCanvas(QWidget):
 
     def paintEvent(self, event):  # noqa: N802
         p = QPainter(self)
-        p.fillRect(self.rect(), self._bg)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        viewport_path = continuous_path(QRectF(self.rect()), 10)
+        p.setClipPath(viewport_path)
+        p.fillPath(viewport_path, self._bg)
         rect = self._target_rect()
         if rect is None:
             p.setPen(QColor("#8b919c"))
@@ -230,7 +235,7 @@ class PreviewCanvas(QWidget):
                 ly = max(y + 2, ry - th - 3)
                 p.setPen(Qt.NoPen)
                 p.setBrush(QColor(47, 111, 208, 225))
-                p.drawRoundedRect(lx, ly, tw, th, 4, 4)
+                p.drawPath(continuous_path(QRectF(lx, ly, tw, th), 4))
                 p.setBrush(Qt.NoBrush)
                 p.setPen(QColor("#ffffff"))
                 p.drawText(lx + 6, ly + th - 5, label)
@@ -241,7 +246,7 @@ class PreviewCanvas(QWidget):
             th = metrics.height() + 6
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(255, 255, 255, 214))
-            p.drawRoundedRect(8, 8, tw, th, 5, 5)
+            p.drawPath(continuous_path(QRectF(8, 8, tw, th), 5))
             p.setBrush(Qt.NoBrush)
             p.setPen(QColor("#5c636e"))
             p.drawText(15, 8 + th - 6, self._caption)
@@ -255,7 +260,7 @@ class PreviewCanvas(QWidget):
             by = self.height() - th - 10
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(28, 34, 46, 190))
-            p.drawRoundedRect(bx, by, tw, th, 6, 6)
+            p.drawPath(continuous_path(QRectF(bx, by, tw, th), 6))
             p.setBrush(Qt.NoBrush)
             p.setPen(QColor("#ffffff"))
             p.drawText(bx + 8, by + th - 7, text)

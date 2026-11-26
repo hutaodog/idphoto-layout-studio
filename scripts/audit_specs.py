@@ -25,6 +25,10 @@ PAPER_STD = {
 def main() -> int:
     lib = SpecLibrary.load()
     problems = []
+    try:
+        lib.require()
+    except ValueError as exc:
+        problems.append(str(exc))
 
     print("=" * 78)
     print("一、相纸尺寸（mm / px / 300dpi 回算）")
@@ -46,7 +50,7 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("二、照片规格自洽性（px == round(mm/25.4*dpi)，容差 0）")
+    print("二、照片规格自洽性（px == round(mm/25.4*dpi)，容差 1px）")
     print("=" * 78)
     bad = 0
     for s in lib.photos:
@@ -78,7 +82,7 @@ def main() -> int:
                     s.name_zh, s.id, s.dpi, s.confidence))
         problems.append("「中国常用」里还有同尺寸重复项")
     else:
-        print("     ✓ 中国常用：没有同尺寸重复")
+        print("     [OK] 中国常用：没有同尺寸重复")
     print()
     print("  其它分类里「同尺寸多条」是**故意的**——它们是一条报名系统 / 一个国家一条，")
     print("  底色、文件大小、头部比例都可能不同，合并会丢信息：")
@@ -120,10 +124,23 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("结论：%s" % ("发现问题 %d 类" % len(problems) if problems else "没有硬伤"))
+    print("六、本轮重点规格的来源与适用范围（不是全库现行标准认证）")
+    for id in ("cn_yicun", "cn_ercun", "cn_resume_wide", "cn_sancun", "exam_ncre"):
+        spec = lib.photo(id)
+        print("  %s %s  %s级  %s" % (spec.id, spec.name_zh, spec.confidence, spec.px))
+        if spec.mm_from_px:
+            print("    mm为数字像素反算的兼容打印值，非官方实体尺寸要求")
+        for ref in spec.refs:
+            print("    %s | %s | 核验%s" % (ref["issuer"], ref["url"], ref["verified"]))
+            print("    " + ref["scope"])
+    missing = sum(not spec.refs for spec in lib.photos)
+    print("  另有%d条沿用历史source说明，尚无本轮逐项URL核验记录。" % missing)
+    print("  三寸55×84mm仅商业服务参考；NCRE保留2022像素与2026毫米单位冲突。")
+    print("结论：%s" % ("发现问题 %d 类" % len(problems) if problems else "结构、换算及排版检查通过"))
+    print("数学自洽不代表受理通过；业务要求以当期通知和报名系统为准。")
     for p in problems:
         print("  - " + p)
-    return 0
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

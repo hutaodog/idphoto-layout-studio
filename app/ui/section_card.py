@@ -11,16 +11,20 @@
 """
 from __future__ import annotations
 
-from typing import Optional
+import time
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import (QAbstractAnimation, QEvent, QPointF, QSignalBlocker,
+                            QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QSizePolicy,
+                               QVBoxLayout, QWidget)
 
 from . import style
+from .corners import apply_surface, continuous_path
+from .motion import REVEAL_CLOSE, REVEAL_OPEN, spring_state
 
 HEAD_H = 44          # 标题行高度
-RADIUS = 12
+RADIUS = style.PANEL_RADIUS
 PAD = 16             # 卡片左右内边距
 
 
@@ -37,7 +41,7 @@ def paint_icon(p: QPainter, name: str, r: QRectF, color: QColor) -> None:
             p.drawLine(QPointF(x + w * 0.30, yy), QPointF(x + w * 0.92, yy))
             p.drawPoint(QPointF(x + w * 0.10, yy))
     elif name == "id":
-        p.drawRoundedRect(QRectF(x + w * 0.06, y + h * 0.20, w * 0.88, h * 0.60), 2.5, 2.5)
+        p.drawPath(continuous_path(QRectF(x + w * 0.06, y + h * 0.20, w * 0.88, h * 0.60), 2.5))
         p.drawEllipse(QPointF(x + w * 0.33, cy - h * 0.02), w * 0.11, h * 0.11)
         p.drawLine(QPointF(x + w * 0.52, cy - h * 0.10), QPointF(x + w * 0.84, cy - h * 0.10))
         p.drawLine(QPointF(x + w * 0.52, cy + h * 0.10), QPointF(x + w * 0.78, cy + h * 0.10))
@@ -59,10 +63,10 @@ def paint_icon(p: QPainter, name: str, r: QRectF, color: QColor) -> None:
         s = w * 0.34
         for i in range(2):
             for j in range(2):
-                p.drawRoundedRect(QRectF(x + w * 0.14 + i * (s + w * 0.18),
-                                         y + h * 0.14 + j * (s + h * 0.18), s, s), 2, 2)
+                p.drawPath(continuous_path(QRectF(x + w * 0.14 + i * (s + w * 0.18),
+                                                 y + h * 0.14 + j * (s + h * 0.18), s, s), 2))
     elif name == "printer":
-        p.drawRoundedRect(QRectF(x + w * 0.16, y + h * 0.38, w * 0.68, h * 0.40), 2.5, 2.5)
+        p.drawPath(continuous_path(QRectF(x + w * 0.16, y + h * 0.38, w * 0.68, h * 0.40), 2.5))
         p.drawRect(QRectF(x + w * 0.28, y + h * 0.16, w * 0.44, h * 0.24))
         p.drawRect(QRectF(x + w * 0.28, y + h * 0.62, w * 0.44, h * 0.26))
     elif name == "log":
@@ -81,6 +85,7 @@ class _Header(QWidget):
         self._icon = icon
         self._hover = False
         self._expanded = True
+        self._reveal = 1.0
         h = QHBoxLayout(self)
         h.setContentsMargins(PAD, 0, PAD, 0)
         h.setSpacing(9)
@@ -103,7 +108,12 @@ class _Header(QWidget):
 
     def set_expanded(self, on: bool) -> None:
         self._expanded = on
-        self.update()
+        self.set_reveal(1.0 if on else 0.0)
+
+    def set_reveal(self, value: float) -> None:
+        if value != self._reveal:
+            self._reveal = value
+            self.update()
 
     def enterEvent(self, e):                               # noqa: N802
         self._hover = True
@@ -126,13 +136,13 @@ class _Header(QWidget):
         if self._hover:
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#f6f7f9"))
-            p.drawRoundedRect(QRectF(self.rect()).adjusted(6, 4, -6, -4), 8, 8)
+            p.drawPath(continuous_path(QRectF(self.rect()).adjusted(6, 4, -6, -4), 8))
 
         # 图标：浅色圆角底 + 线性图标
         box = QRectF(PAD, (self.height() - 18) / 2.0, 18, 18)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(style.PRIMARY_SOFT))
-        p.drawRoundedRect(box.adjusted(-5, -5, 5, 5), 7, 7)
+        p.drawPath(continuous_path(box.adjusted(-5, -5, 5, 5), 7))
         # 图标要画在标题左边，所以这里把标题行整体右移：用 layout 的 spacing 实现，
         # 这里只负责把图标画在预留的位置上。
         paint_icon(p, self._icon, box, QColor(style.PRIMARY))
@@ -141,16 +151,64 @@ class _Header(QWidget):
         ax = self.width() - PAD - 12
         ay = self.height() / 2.0
         p.setPen(QPen(QColor(style.MUTED), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        if self._expanded:
-            p.drawPolyline([QPointF(ax, ay - 2.5), QPointF(ax + 5, ay + 3),
-                            QPointF(ax + 10, ay - 2.5)])
-        else:
-            p.drawPolyline([QPointF(ax, ay + 3), QPointF(ax + 5, ay - 2.5),
-                            QPointF(ax + 10, ay + 3)])
+        p.translate(ax + 5, ay)
+        p.rotate(180.0 * (1.0 - self._reveal))
+        p.drawPolyline([QPointF(-5, -2.5), QPointF(0, 3), QPointF(5, -2.5)])
+
+
+class _Reveal(QWidget):
+    """只改变可见高度，内容始终按自然尺寸排版，防止回弹挤压文字和控件。"""
+
+    metricsChanged = Signal()
+
+    def __init__(self, content: QWidget, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.body = QWidget(self)
+        layout = QVBoxLayout(self.body)
+        layout.setContentsMargins(PAD, 0, PAD, PAD)
+        layout.setSpacing(0)
+        layout.addWidget(content)
+        self._metrics_pending = False
+        self.body.installEventFilter(self)
+
+    def natural_height(self) -> int:
+        layout = self.body.layout()
+        height = layout.heightForWidth(max(1, self.width()))
+        return max(0, height if height >= 0 else layout.sizeHint().height())
+
+    def expanded_size_hint(self) -> QSize:
+        return QSize(self.body.minimumSizeHint().width(), self.natural_height())
+
+    def set_body_height(self, height: int) -> None:
+        """只在内容或宽度变化时排版，动画帧只裁切这个固定尺寸的正文。"""
+        self.body.setGeometry(0, 0, self.width(), height)
+
+    def set_reveal_height(self, value: float) -> None:
+        height = max(0, round(value))
+        if self.minimumHeight() != height or self.maximumHeight() != height:
+            self.setFixedHeight(height)
+
+    def _notify_metrics(self) -> None:
+        self._metrics_pending = False
+        self.metricsChanged.emit()
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if event.type() == QEvent.LayoutRequest and not self._metrics_pending:
+            self._metrics_pending = True
+            QTimer.singleShot(0, self._notify_metrics)
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.metricsChanged.emit()
 
 
 class SectionCard(QWidget):
     """白卡片 + 可折叠标题行。内容就是传进来的控件。"""
+
+    heightAboutToChange = Signal()
 
     def __init__(self, title: str, content: QWidget, icon: str = "sliders",
                  sub: str = "", summary: str = "", expanded: bool = True,
@@ -162,6 +220,7 @@ class SectionCard(QWidget):
         self.setStyleSheet(
             "QWidget#sectionCard{background:%s;border:1px solid %s;border-radius:%dpx;}"
             % (style.CARD, style.BORDER, RADIUS))
+        apply_surface(self, style.CARD, style.BORDER, RADIUS)
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
@@ -177,26 +236,135 @@ class SectionCard(QWidget):
         v.addWidget(self.header)
 
         self.content = content
-        content.setParent(self)
-        wrap = QWidget()
-        wv = QVBoxLayout(wrap)
-        wv.setContentsMargins(PAD, 0, PAD, PAD)
-        wv.setSpacing(0)
-        wv.addWidget(content)
-        self._wrap = wrap
-        v.addWidget(wrap)
-        wrap.setVisible(expanded)
-        self.header.set_expanded(expanded)
+        self._wrap = _Reveal(content, self)
+        v.addWidget(self._wrap)
         self._expanded = expanded
+        self._open_height = self._wrap.natural_height()
+        self._height = float(self._open_height if expanded else 0)
+        self._velocity = 0.0
+        self._start_height = self._height
+        self._start_velocity = 0.0
+        self._target_height = self._height
+        self._started_at = time.perf_counter()
+        self._damping = REVEAL_OPEN.damping
+        self._frequency = REVEAL_OPEN.frequency
+        # Qt's shared animation clock drives all cards. Values are only ticks: the
+        # spring below retains both position and speed when the user reverses it.
+        self._animation = QVariantAnimation(self)
+        self._animation.setStartValue(0.0)
+        self._animation.setEndValue(1.0)
+        self._animation.setDuration(1000)
+        self._animation.valueChanged.connect(self._tick_transition)
+        self._animation.finished.connect(self._finish_transition)
+        self._wrap.metricsChanged.connect(self._sync_content_height)
+        self.set_expanded(expanded, animate=False)
 
     # ------------------------------------------------------------------ 状态
     def toggle(self) -> None:
         self.set_expanded(not self._expanded)
 
-    def set_expanded(self, on: bool) -> None:
+    def _apply_height(self, value: float) -> None:
+        self._height = max(0.0, float(value))
+        if round(self._height) != self._wrap.minimumHeight():
+            # A scroll host must reserve its current viewport before Qt shrinks
+            # the content minimum and clamps the scrollbar in the next layout.
+            self.heightAboutToChange.emit()
+        self._wrap.set_reveal_height(self._height)
+        self.header.set_reveal(min(1.0, self._height / max(1, self._open_height)))
+
+    def _spring_state(self, elapsed: float) -> tuple[float, float]:
+        height, speed = spring_state(
+            self._start_height, self._start_velocity, self._target_height, elapsed,
+            frequency=self._frequency, damping=self._damping)
+        if height <= 0.0:
+            return 0.0, max(0.0, speed)
+        return height, speed
+
+    def _tick_transition(self, _value=None) -> None:
+        if self._animation.state() != QAbstractAnimation.Running:
+            return
+        self._height, self._velocity = self._spring_state(time.perf_counter() - self._started_at)
+        self._apply_height(self._height)
+        if (abs(self._height - self._target_height) < 0.25
+                and abs(self._velocity) < 4.0):
+            self._finish_transition()
+
+    def _finish_transition(self) -> None:
+        self._animation.stop()
+        self._velocity = self._start_velocity = 0.0
+        self._start_height = self._target_height = float(self._open_height if self._expanded else 0)
+        self._apply_height(self._target_height)
+        self._wrap.setVisible(self._expanded)
+        self.header.set_expanded(self._expanded)
+
+    def _start_transition(self, target: float) -> None:
+        # Use the last rendered position/speed, including for a click that lands
+        # between frames. Sampling the old trajectory here would jump pixels.
+        self._start_height = self._height
+        self._start_velocity = self._velocity
+        self._target_height = float(target)
+        profile = REVEAL_OPEN if self._expanded else REVEAL_CLOSE
+        self._damping = profile.damping
+        self._frequency = profile.frequency
+        self._started_at = time.perf_counter()
+        # Qt can emit old interpolated values while resetting its clock. Block
+        # setup and the synchronous start tick so neither becomes a frame.
+        with QSignalBlocker(self._animation):
+            self._animation.stop()
+            self._animation.setCurrentTime(0)
+            self._animation.start()
+        # A hidden body receives its current width on show. Its synchronous
+        # metrics signal must see a running transition so it retargets rather
+        # than settling the card at full height during the initiating click.
+        self._wrap.show()
+
+    def _sync_content_height(self) -> None:
+        height = self._wrap.natural_height()
+        self._wrap.set_body_height(height)
+        if height == self._open_height:
+            return
+        running = self._animation.state() == QAbstractAnimation.Running
+        self._open_height = height
+        if self._expanded and running:
+            self._start_transition(height)
+        elif self._expanded:
+            self._finish_transition()
+
+    def set_expanded(self, on: bool, animate: bool = True) -> None:
+        on = bool(on)
+        running = self._animation.state() == QAbstractAnimation.Running
+        if on == self._expanded and running and animate:
+            return
+        if not on:
+            focused = QApplication.focusWidget()
+            if focused is not None and self._wrap.isAncestorOf(focused):
+                # Hiding a focused editor otherwise transfers focus to a later
+                # card; QScrollArea then scrolls that new editor into view.
+                focused.clearFocus()
         self._expanded = on
-        self._wrap.setVisible(on)
-        self.header.set_expanded(on)
+        self._open_height = self._wrap.natural_height()
+        self._wrap.set_body_height(self._open_height)
+        target = self._open_height if on else 0
+        if (not animate or not self.isVisible() or not self.isEnabled()
+                or (abs(self._height - target) < 0.25 and abs(self._velocity) < 4.0)):
+            self._finish_transition()
+            return
+        self._start_transition(target)
+
+    def expanded_size_hint(self) -> QSize:
+        """折叠时也可量完整内容宽度，不切换状态或打断正在运行的动画。"""
+        hint = self._wrap.expanded_size_hint()
+        return QSize(max(hint.width(), self.header.minimumSizeHint().width()),
+                     HEAD_H + hint.height())
+
+    def hideEvent(self, event):  # noqa: N802
+        self._finish_transition()
+        super().hideEvent(event)
+
+    def changeEvent(self, event):  # noqa: N802
+        if event.type() == QEvent.EnabledChange and not self.isEnabled():
+            self._finish_transition()
+        super().changeEvent(event)
 
     def is_expanded(self) -> bool:
         return self._expanded

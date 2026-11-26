@@ -3,21 +3,18 @@
 本项目的算法内核是 [Zeyi-Lin/HivisionIDPhotos](https://github.com/Zeyi-Lin/HivisionIDPhotos)（Apache-2.0），
 以 **vendor（内嵌副本）** 方式放在 `app/vendor/hivision/`，不通过 pip 依赖。
 
-**为什么 vendor**：上游已停更（master 末次提交只改了 README，106 个 issue 无人处理），
-我们必须自己维护下面这些改动。
+**为什么 vendor**：桌面程序需要维护下面这些本地改动，并在版本控制中保留可审查的内核副本。此处不判断上游当前维护状态。
 
-**重建方式**：先准备一份上游源码，再跑 `python app/vendor/build_vendor.py --upstream <上游目录>`。
+**日常构建**直接使用已提交的 `app/vendor/hivision/`，不需要重新生成。`build_vendor.py` 目前只自动实现PATCH-1至PATCH-4，**尚未自动重放v1.6.7的PATCH-5**；不要直接用它覆盖当前内核。
+
+需要升级上游时，先输出到独立暂存目录，再按本文和版本差异迁移PATCH-5、检查来源与许可并跑回归：
 
 ```powershell
 git clone --depth 1 https://github.com/Zeyi-Lin/HivisionIDPhotos.git .tmp\upstream
-.venv\Scripts\python.exe app\vendor\build_vendor.py --upstream .tmp\upstream
+.venv\Scripts\python.exe app\vendor\build_vendor.py --upstream .tmp\upstream --dest .tmp\vendor-stage\hivision
 ```
 
-> 调研阶段 clone 的副本原本放在 `_research\hivision\`，那是过程产物、**已经清掉了**；
-> `build_vendor.py` 的 `--upstream` 默认值仍指向它，所以现在必须显式传路径（照上面这样）。
-> 重建只在需要重新打补丁时才做——`app/vendor/hivision/` 已经是打好的副本，日常构建不需要上游。
-
-每一处补丁都带字面量断言：上游改动导致补丁失配时会立刻报错，绝不静默跳过。
+脚本的PATCH-1至PATCH-4有字面量断言，上游变动导致失配会报错；这些断言不证明PATCH-5已存在，也不代替处理/裁剪测试。
 
 ---
 
@@ -84,6 +81,22 @@ git clone --depth 1 https://github.com/Zeyi-Lin/HivisionIDPhotos.git .tmp\upstre
 最终 `a = cv2.add(a, 255 - a_contour)` 的效果是**把人像轮廓内部的半透明空洞补成不透明**，
 并不会收缩成品 alpha。因此默认保持开启。
 界面上的「启用抠图内部空洞修补」勾选框即对应本开关。
+
+---
+
+## PATCH-5 · 原底色与同源裁剪（v1.6.7）
+
+**文件**：`hivision/creator/context.py`、`creator/__init__.py`、`creator/photo_adjuster.py`。
+
+- `Result`增加可选`original_standard`和`original_source`，每次正常照片处理都携带对应的自动裁剪原图和归一化原图，切换背景模式不必再分割。
+- `adjust_photo`在两次裁剪、尺寸归一、上移和水平翻转时同步处理原图，新增第五个返回值`original_standard`；唯一生产调用方同步解包。第二次裁剪不错误地缩放回第一次的尺寸。
+- 原图越界时复制边缘像素。开启人脸旋转矫正时，原图与抠图使用相同角度和画布几何；默认桌面流程不启用此可选矫正。
+- 应用层`pipeline.py`在同一坐标几何中选择原图BGR或抠图BGRA；手动裁剪直接采样到目标输出尺寸，避免小缩放值分配巨型中间图。无来源/来源尺寸不匹配时报错。
+- `Processor`把hollow环境变量的设置、推理和恢复放在同一锁内，异常也恢复原值，避免不同请求相互污染。这是应用层串行化，不是把上游环境变量改成了线程局部参数。
+
+验证：`tests/test_crop_geometry.py`覆盖精确源切片、像素中心、旋转同几何、透明图、输出分配上界和真实并发环境变量恢复；`tests/test_pipeline.py`用实际模型与合成人像检查自动/手动原底色来源；`tests/test_request_flow.py`使用真实QThread和受控推理器检查最新请求/模式及预览导出一致。
+
+限制：来源是长边最多2000像素的归一化图，不承诺逐字节保留原文件；不会自动去除原背景瑕疵。上游再生成脚本尚未包含此补丁，迁移时须人工保留并跑测试。
 
 ---
 

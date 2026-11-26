@@ -168,11 +168,12 @@ class IDCreator:
 
             # 根据角度旋转原图和抠图
             b, g, r, a = cv2.split(ctx.matting_image)
-            ctx.origin_image, ctx.matting_image, _, _, _, _ = rotate_bound_4channels(
-                cv2.merge((b, g, r)),
-                a,
-                -1 * ctx.face["roll_angle"],
-            )
+            matting_rgb, aligned_matting, _, _, _, _ = rotate_bound_4channels(
+                cv2.merge((b, g, r)), a, -1 * ctx.face["roll_angle"])
+            from hivision.creator.rotation_adjust import rotate_bound
+            ctx.origin_image = rotate_bound(
+                ctx.origin_image, -1 * ctx.face["roll_angle"])[0]
+            ctx.matting_image = aligned_matting
 
             # 旋转后再执行一遍人脸检测
             self.detection_handler(ctx)
@@ -183,9 +184,8 @@ class IDCreator:
         # 4. ------------------图像调整------------------
         print("[4]  Start Image Post-Adjustment...")
         start_adjust_time = time.time()
-        result_image_hd, result_image_standard, clothing_params, typography_params = (
-            adjust_photo(ctx)
-        )
+        (result_image_hd, result_image_standard, clothing_params,
+         typography_params, original_standard) = adjust_photo(ctx)
         end_adjust_time = time.time()
         print(f"[4]  Image Post-Adjustment Time: {end_adjust_time - start_adjust_time:.3f}s")
 
@@ -197,6 +197,8 @@ class IDCreator:
             clothing_params=clothing_params,
             typography_params=typography_params,
             face=ctx.face,
+            original_standard=original_standard,
+            original_source=ctx.origin_image,
         )
         self.after_all and self.after_all(ctx)
 

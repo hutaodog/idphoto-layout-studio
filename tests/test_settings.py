@@ -67,3 +67,29 @@ def test_broken_settings_file_does_not_crash(isolated):
     (isolated / "settings.json").write_text("{ 这不是 json", encoding="utf-8")
     data = st.load()
     assert data["out_dir"] == "" and data["update_sources"], "坏文件要退回默认值"
+
+
+def test_real_settings_path_uses_app_paths_import(monkeypatch, tmp_path):
+    from app import paths
+    monkeypatch.setattr(paths, "app_dir", lambda: str(tmp_path))
+    assert st.settings_path() == str(tmp_path / "settings.json")
+    st.save(preserve_original_background=True)
+    assert st.load()["preserve_original_background"] is True
+
+
+def test_failed_atomic_save_preserves_previous_file(isolated, monkeypatch):
+    st.save(out_dir="previous", preserve_original_background=True)
+    before = (isolated / "settings.json").read_bytes()
+    def fail(*args):
+        raise PermissionError("settings target is read-only")
+    monkeypatch.setattr(st.os, "replace", fail)
+    with pytest.raises(PermissionError, match="read-only"):
+        st.save(out_dir="new")
+    assert (isolated / "settings.json").read_bytes() == before
+    assert not list(isolated.glob(".settings-*"))
+
+
+def test_original_background_accepts_only_json_booleans(isolated):
+    (isolated / "settings.json").write_text(
+        '{"preserve_original_background": "false"}', encoding="utf-8")
+    assert st.load()["preserve_original_background"] is False

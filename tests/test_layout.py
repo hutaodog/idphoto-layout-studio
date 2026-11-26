@@ -116,6 +116,46 @@ def test_plan_for_spec_uses_one_ruler_for_paper_and_photo(lib):
 
 
 
+def test_orientation_ties_prefer_unrotated():
+    """Equal counts choose the source orientation deterministically."""
+    plan = plan_layout((100, 100), (20, 30), dpi=300, gap_mm=0,
+                       margin_mm=0, allow_rotate=True)
+    assert plan.count == 15
+    assert plan.rotated is False
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_renderer_rotates_pixels_clockwise_before_resizing(scale):
+    """Rotated placement preserves the expected source-pixel orientation."""
+    plan = plan_layout((3, 2), (2, 3), dpi=300, gap_mm=0,
+                       margin_mm=0, allow_rotate=True)
+    assert plan.rotated and plan.photo_px == (3, 2)
+    photo = np.array([[[1, 1, 1], [2, 2, 2]],
+                      [[3, 3, 3], [4, 4, 4]],
+                      [[5, 5, 5], [6, 6, 6]]], dtype=np.uint8)
+    photo = np.repeat(np.repeat(photo, scale, axis=0), scale, axis=1)
+    canvas = render_layout(photo, plan)
+    expected = np.array([[5, 3, 1], [6, 4, 2]], dtype=np.uint8)
+    assert np.array_equal(canvas[:, :, 0], expected)
+
+
+def test_crop_guides_include_exact_right_and_bottom_edges():
+    """Guide pixels at paper bounds remain visible and box lines stay local."""
+    plan = plan_layout((9, 8), (4, 3), dpi=300, gap_mm=0,
+                       margin_mm=0, allow_rotate=False)
+    # Pin one tile to the right and bottom canvas edges.
+    plan.positions = [(5, 5)]
+    plan.cols = plan.rows = 1
+    tile = np.full((3, 4, 3), 90, np.uint8)
+    cross = render_layout(tile, plan, crop_line="cross")
+    assert np.all(cross[:, 8] == 200)  # right edge, not x == paper width
+    assert np.all(cross[7, :] == 200)   # bottom edge, not y == paper height
+    box = render_layout(tile, plan, crop_line="box")
+    assert np.all(box[5:8, 5] == 200) and np.all(box[5:8, 8] == 200)
+    assert np.all(box[5, 5:9] == 200) and np.all(box[7, 5:9] == 200)
+    assert np.all(box[:5, :] == 255) and np.all(box[:, :5] == 255)
+
+
 def test_rotation_takes_the_better_one(lib):
     """7 寸排 1 寸照必须旋转才排得下 18 张（不旋转只有 16 张）。"""
     spec, paper = lib.photo("cn_yicun"), lib.paper("7inch")
@@ -221,3 +261,68 @@ def test_empty_when_photo_larger_than_paper(lib):
     assert plan.is_empty
     canvas = render_layout(np.zeros((500, 500, 3), np.uint8), plan)
     assert canvas.shape == (100, 100, 3)
+
+
+@pytest.mark.parametrize("style", ["cross", "box"])
+@pytest.mark.parametrize("dpi", [300, 350])
+def test_crop_guides_cut_exact_photo_size_instead_of_gap_midpoints(lib, style, dpi):
+    spec, paper = lib.photo("cn_yicun"), lib.paper("6inch")
+    plan = plan_for_spec(paper, spec, dpi=dpi, gap_mm=4)
+    iw, ih = plan.photo_px
+    photo = np.full((spec.px[1], spec.px[0], 3), 90, np.uint8)
+    canvas = render_layout(photo, plan, crop_line=style)
+    x, y = plan.positions[0]
+    # Observe the actual rendered guides through each tile's interior, rather
+    # than deriving an expected result from the planner's block dimensions.
+    xs = np.flatnonzero(np.all(canvas[y + ih // 2] == 200, axis=1))
+    ys = np.flatnonzero(np.all(canvas[:, x + iw // 2] == 200, axis=1))
+    assert xs.tolist() == sorted({edge for px, _ in plan.positions
+                                 for edge in (px, px + iw)})
+    assert ys.tolist() == sorted({edge for _, py in plan.positions
+                                 for edge in (py, py + ih)})
+    cut = canvas[ys[0]:ys[1], xs[0]:xs[1]]
+    assert cut.shape[:2] == (ih, iw)
+    assert np.all(cut[1:, 1:] == 90)
+    cut_mm = sorted((cut.shape[1] / dpi * 25.4, cut.shape[0] / dpi * 25.4))
+    assert cut_mm == pytest.approx(sorted(spec.mm_size), abs=25.4 / dpi)
+    assert np.all(canvas[y + ih // 2, x + iw + plan.gap_px // 2] == 255)
+    assert np.all(canvas[y + ih + plan.gap_px // 2, x + iw // 2] == 255)
+    if style == "box":
+        assert np.all(canvas[y + ih, x + iw] == 200)  # closed lower-right corner
+
+
+@pytest.mark.parametrize("options", [
+    {"gap_mm": -1}, {"gap_mm": float("nan")}, {"gap_mm": float("inf")},
+    {"margin_mm": -1}, {"margin_mm": float("nan")},
+    {"margin_mm": float("inf")}, {"gap_mm": True},
+    {"dpi": 0}, {"dpi": -300}, {"dpi": 300.5}, {"dpi": True},
+])
+def test_layout_rejects_invalid_rulers(options):
+    with pytest.raises(ValueError):
+        plan_layout((100, 100), (20, 30), **options)
+
+
+@pytest.mark.parametrize("dpi", [0, -1, float("nan"), float("inf"), 300.5, True])
+def test_plan_for_spec_rejects_invalid_dpi_before_converting(lib, dpi):
+    with pytest.raises(ValueError, match="dpi"):
+        plan_for_spec(lib.paper("6inch"), lib.photo("cn_yicun"), dpi=dpi)
+
+
+@pytest.mark.parametrize("count", [0, -1, 1.5, True])
+def test_smallest_paper_rejects_invalid_count_even_without_papers(count):
+    with pytest.raises(ValueError, match="照片张数"):
+        smallest_paper_for(count, (20, 30), [])
+
+
+def test_large_margins_give_empty_plan_without_negative_positions():
+    plan = plan_layout((100, 100), (20, 30), margin_mm=100)
+    assert plan.is_empty
+    assert all(value >= 0 for value in plan.origin)
+
+
+@pytest.mark.parametrize("options", [{"crop_line": "invalid"}, {"line_width": 0},
+                                     {"line_width": 1.5}])
+def test_render_rejects_invalid_crop_guides(options):
+    plan = plan_layout((100, 100), (20, 30), gap_mm=0, margin_mm=0)
+    with pytest.raises(ValueError):
+        render_layout(np.zeros((30, 20, 3), np.uint8), plan, **options)

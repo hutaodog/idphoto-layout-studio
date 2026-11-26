@@ -219,6 +219,33 @@ def set_round_corners(hwnd: int, small: bool = False) -> bool:
         return False
 
 
+def disable_system_round_corners(hwnd: int) -> bool:
+    """Leave the application-drawn continuous silhouette unmodified by DWM arcs."""
+    if not sys.platform.startswith("win") or not hwnd:
+        return False
+    try:
+        value = ctypes.c_int(1)  # DWMWCP_DONOTROUND
+        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), _DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(value), ctypes.sizeof(value))
+        return result == 0
+    except (AttributeError, OSError):
+        return False
+
+
+def clear_round_region(hwnd: int) -> bool:
+    """Clear native regions too; Qt clearMask alone may not own an older HRGN."""
+    if not sys.platform.startswith("win") or not hwnd:
+        return False
+    try:
+        call = ctypes.windll.user32.SetWindowRgn
+        call.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
+        call.restype = ctypes.c_int
+        return bool(call(ctypes.c_void_p(hwnd), None, True))
+    except (AttributeError, OSError):
+        return False
+
+
 def apply_round_region(hwnd: int, w: int, h: int, radius: int) -> bool:
     """把**窗口本身**裁成圆角。
 

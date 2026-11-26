@@ -17,24 +17,27 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
                                QWidget)
 
 from ..core import weights as wcore
 from . import style
+from .corners import apply_surface, capsule_path, continuous_path, remove_surface
+from .motion import FEEDBACK, busy_band, spring_state
 
-RADIUS = 14
+RADIUS = style.DIALOG_RADIUS
 PAD = 26
 
 
 def _round_tile(p: QPainter, size: int, color: QColor, radius: int = 10) -> None:
     p.setPen(Qt.NoPen)
     p.setBrush(color)
-    p.drawRoundedRect(QRectF(0, 0, size, size), radius, radius)
+    p.drawPath(continuous_path(QRectF(0, 0, size, size), radius))
 
 
 def _check_pixmap(size: int = 34) -> "QPixmap":
@@ -96,48 +99,106 @@ class ProgressBar(QWidget):
         self._value = 0.0                    # 0.0 ~ 1.0
         self._indeterminate = False
         self._phase = 0.0
+        self._display_value = self._velocity = 0.0
+        self._last_tick = time.perf_counter()
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.PreciseTimer)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._advance)
         self.setFixedHeight(8)
         self.setMinimumWidth(200)
 
     def set_value(self, frac: float) -> None:
-        self._value = max(0.0, min(1.0, float(frac)))
+        target = max(0.0, min(1.0, float(frac)))
+        changed = target != self._value or self._indeterminate
+        self._value = target
         self._indeterminate = False
+        if not self.isVisible() or not self.isEnabled():
+            self._display_value, self._velocity = target, 0.0
+        if changed:
+            self._last_tick = time.perf_counter()
+        self._sync_timer()
         self.update()
 
     def set_indeterminate(self, on: bool) -> None:
-        self._indeterminate = bool(on)
+        on = bool(on)
+        if on != self._indeterminate:
+            self._last_tick = time.perf_counter()
+        self._indeterminate = on
+        self._sync_timer()
         self.update()
 
+    def _sync_timer(self):
+        moving = (self._indeterminate or abs(self._display_value - self._value) > .0001
+                  or abs(self._velocity) > .001)
+        if self.isVisible() and self.isEnabled() and moving:
+            if not self._timer.isActive():
+                self._last_tick = time.perf_counter()
+                self._timer.start()
+        else:
+            self._timer.stop()
+
+    def _advance(self):
+        now = time.perf_counter()
+        elapsed = max(0.0, now - self._last_tick)
+        self._last_tick = now
+        if self._indeterminate:
+            self._phase = (self._phase + elapsed / 1.4) % 1.0
+        else:
+            self._display_value, self._velocity = spring_state(
+                self._display_value, self._velocity, self._value, elapsed,
+                frequency=FEEDBACK.frequency, damping=FEEDBACK.damping)
+            if self._display_value < 0 or self._display_value > 1:
+                self._display_value = max(0.0, min(1.0, self._display_value))
+                self._velocity = 0.0
+            if abs(self._display_value - self._value) < .0001 and abs(self._velocity) < .001:
+                self._display_value, self._velocity = self._value, 0.0
+        self.update()
+        self._sync_timer()
+
     def tick(self, step: float = 0.06) -> None:
+        # Retained for explicit rendering/capture; normal playback uses elapsed time.
         self._phase = (self._phase + step) % 1.0
         if self._indeterminate:
             self.update()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self._last_tick = time.perf_counter()
+        self._sync_timer()
+
+    def hideEvent(self, event):  # noqa: N802
+        self._timer.stop()
+        self._display_value, self._velocity = self._value, 0.0
+        super().hideEvent(event)
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.EnabledChange:
+            if not self.isEnabled():
+                self._display_value, self._velocity = self._value, 0.0
+            self._sync_timer()
 
     def paintEvent(self, e):                                  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         r = QRectF(0, 0, self.width(), self.height())
-        radius = self.height() / 2.0
+        track = capsule_path(r)
         # 轨道
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(style.BORDER))
-        p.drawRoundedRect(r, radius, radius)
+        p.drawPath(track)
         # 已下载部分（或来回跑的光带）
         p.setBrush(QColor(style.PRIMARY))
         if self._indeterminate:
-            span = r.width() * 0.30
-            x = -span + (r.width() + span) * self._phase
-            band = QRectF(max(0.0, x), 0.0, min(span, r.width()), r.height())
-            path = QPainterPath()
-            path.addRoundedRect(band, radius, radius)
-            p.setClipRect(r)
-            p.drawPath(path)
-        elif self._value > 0:
-            fill = QRectF(r.left(), r.top(), max(r.height(), r.width() * self._value),
+            offset, span = busy_band(self._phase)
+            band = QRectF(r.left() + offset * r.width(), r.top(), span * r.width(), r.height())
+            p.setClipPath(track)
+            p.drawPath(capsule_path(band))
+        elif self._display_value > 0:
+            fill = QRectF(r.left(), r.top(), max(r.height(), r.width() * self._display_value),
                           r.height())
-            path = QPainterPath()
-            path.addRoundedRect(fill, radius, radius)
-            p.drawPath(path)
+            p.drawPath(capsule_path(fill))
         p.end()
 
 
@@ -239,6 +300,10 @@ class TaskWindow(QWidget):
             style.STYLESHEET +
             "QWidget#taskCard{background:%s;border:1px solid %s;border-radius:%dpx;}"
             % (style.CARD, style.BORDER_STRONG, RADIUS))
+        apply_surface(self.card, style.CARD, style.BORDER_STRONG, RADIUS)
+        apply_surface(self.badge, style.PRIMARY_SOFT, None, 10, border_width=0)
+        apply_surface(self.lbl_note, "#fafbfc", style.BORDER, 8)
+        style.install_continuous_style()
 
         # 光标：整窗可拖动
         self.setCursor(Qt.ArrowCursor)
@@ -354,6 +419,7 @@ class TaskWindow(QWidget):
         self.btn_cancel.setVisible(False)
         self.btn_ok.setVisible(True)
         self.badge.setText("")
+        remove_surface(self.badge)
         self.badge.setStyleSheet("background:transparent;")
         self.badge.setPixmap(_check_pixmap(34))
 
@@ -370,6 +436,7 @@ class TaskWindow(QWidget):
         self.btn_cancel.setVisible(False)
         self.btn_ok.setVisible(True)
         self.badge.setPixmap(_warn_pixmap(34))
+        remove_surface(self.badge)
         self.badge.setStyleSheet("background:transparent;")
         self.adjustSize()
 
@@ -412,6 +479,6 @@ class TaskWindow(QWidget):
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
             off = i + 1
-            p.drawRoundedRect(rect.adjusted(-off, -off + 2, off, off + 2),
-                              RADIUS + off, RADIUS + off)
+            p.drawPath(continuous_path(rect.adjusted(-off, -off + 2, off, off + 2),
+                                       RADIUS + off))
         p.end()

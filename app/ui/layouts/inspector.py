@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QScrollArea, QVBoxLayout,
                                QWidget)
 
 from .. import style
+from ..corners import apply_surface
 from .common import CollapsibleSection, IconRail
 
 NAME = "中控台式"
@@ -25,8 +26,10 @@ def _strip_title(gb) -> None:
     """去掉分组卡片自带的标题带（标题由可折叠分组的 header 负责）。"""
     gb.setTitle("")
     gb.setStyleSheet(
-        "QGroupBox{background:%s;border:1px solid %s;border-radius:12px;"
-        "margin-top:4px;}" % (style.CARD, style.BORDER))
+        "QGroupBox{background:%s;border:1px solid %s;border-radius:%dpx;"
+        "margin-top:4px;}" % (style.CARD, style.BORDER, style.PANEL_RADIUS))
+    apply_surface(gb, style.CARD, style.BORDER, style.PANEL_RADIUS,
+                  rect=lambda widget: widget.rect().adjusted(0, 4, 0, 0))
 
 
 def build(win) -> QWidget:

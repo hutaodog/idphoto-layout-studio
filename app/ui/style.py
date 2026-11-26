@@ -30,9 +30,9 @@ PRIMARY_SOFT = "#eaf1fd"    # 选中态浅底
 DANGER = "#d0453a"
 WARN = "#c8860a"
 
-RADIUS = 8              # 控件圆角
-PANEL_RADIUS = 12       # 卡片圆角
-DIALOG_RADIUS = 18      # 弹窗圆角
+RADIUS = 12             # 控件连续圆角，胶囊另用真正半圆路径
+PANEL_RADIUS = 20       # 卡片连续圆角
+DIALOG_RADIUS = 26      # 弹窗连续圆角
 
 FONT_STACK = ('"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", '
               '"Noto Sans CJK SC", sans-serif')
@@ -299,3 +299,333 @@ QToolTip {{
     border-radius: {RADIUS}px; padding: 6px 9px;
 }}
 """
+
+
+# Painting is kept separate from the QSS above: its box metrics, fonts, padding
+# and foreground-state rules remain the source of truth.
+import time
+import weakref
+
+from shiboken6 import isValid
+from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer
+from PySide6.QtGui import QBrush, QColor, QPainter, QPalette, QPen
+from PySide6.QtWidgets import (
+    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QFrame, QGroupBox, QLabel, QLineEdit,
+    QListWidget, QMenu, QMenuBar, QProgressBar, QPushButton, QScrollBar, QSlider,
+    QSplitterHandle,
+    QStyle, QStyledItemDelegate, QStyleOptionButton, QStyleOptionProgressBar,
+    QStyleOptionSlider, QStyleOptionViewItem, QToolBar, QToolButton, QWidget,
+)
+from .corners import apply_declared_surface, apply_surface, capsule_path, draw_surface
+from .motion import busy_band
+
+
+def _local_override(widget, suffix):
+    widget.setStyleSheet(widget.styleSheet() + "\n" + suffix)
+
+
+class _ContinuousItems(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        painter.save()
+        selected = bool(option.state & QStyle.State_Selected)
+        hover = bool(option.state & QStyle.State_MouseOver)
+        if selected or hover:
+            rect = QRectF(option.rect).adjusted(0, 1, 0, -1)
+            draw_surface(painter, rect, PRIMARY_SOFT if selected else "#f5f7fa",
+                         None, 7, 0)
+        painter.restore()
+        native = QStyleOptionViewItem(option)
+        self.initStyleOption(native, index)
+        native.state &= ~(QStyle.State_Selected | QStyle.State_MouseOver)
+        if selected:
+            native.palette.setColor(QPalette.Text, QColor(PRIMARY))
+            native.palette.setColor(QPalette.WindowText, QColor(PRIMARY))
+        super().paint(painter, native, index)
+
+
+class _ContinuousStyle(QObject):
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self._installing = set()
+        self._busy = weakref.WeakSet()
+        self._phase = 0.0
+        self._last_tick = time.perf_counter()
+        self._style_pending = weakref.WeakSet()
+        self._style_timer = QTimer(self)
+        self._style_timer.setSingleShot(True)
+        self._style_timer.timeout.connect(self._configure_pending)
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.PreciseTimer)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._animate)
+        app.installEventFilter(self)
+        for widget in app.allWidgets():
+            self.configure(widget)
+
+    def _animate(self):
+        now = time.perf_counter()
+        self._phase = (self._phase + max(0.0, now - self._last_tick) / 1.4) % 1.0
+        self._last_tick = now
+        for bar in tuple(self._busy):
+            try:
+                if bar.isVisible() and bar.isEnabled() and bar.minimum() == bar.maximum() == 0:
+                    bar.update()
+                else:
+                    self._busy.discard(bar)
+            except RuntimeError:
+                self._busy.discard(bar)
+        if not self._busy:
+            self._timer.stop()
+
+    def configure(self, w):
+        if not isinstance(w, QWidget) or getattr(w, "_continuous_configured", False):
+            return
+        if id(w) in self._installing or w.property("continuousCorners") is False:
+            return
+        # Custom painters install their own surfaces.  Never cover a hand-drawn
+        # capsule, color swatch, titlebar circle or animated popup viewport.
+        if w.metaObject().className() in ("PillButton", "WindowButton", "ColorSwatch"):
+            return
+        self._installing.add(id(w))
+        try:
+            self._configure(w)
+        finally:
+            self._installing.discard(id(w))
+
+    def _configure(self, w):
+        if getattr(w, "_continuous_surface", None) is not None:
+            w._continuous_configured = True
+            return
+        if isinstance(w, QPushButton):
+            primary, ghost = w.objectName() == "primary", w.objectName() == "ghost"
+            fill = PRIMARY if primary else ("transparent" if ghost else CARD)
+            edge = PRIMARY if primary else BORDER_STRONG
+            states = {
+                "hover": dict(fill=PRIMARY_HOVER if primary else
+                              (PRIMARY_SOFT if ghost else "#f7f9fc"),
+                              border=PRIMARY_HOVER if primary else
+                              ("#bcd0f2" if ghost else "#c6cdd9")),
+                "pressed": dict(fill=PRIMARY_PRESSED if primary else "#eef1f6",
+                                border=PRIMARY_PRESSED if primary else "#c6cdd9"),
+                "disabled": dict(fill="#b9c8e0" if primary else "#f7f8fa",
+                                 border="#b9c8e0" if primary else BORDER),
+            }
+            apply_surface(w, fill, edge, RADIUS, states=states)
+        elif isinstance(w, (QLineEdit, QAbstractSpinBox, QComboBox)):
+            if isinstance(w, QLineEdit) and isinstance(w.parentWidget(),
+                                                       (QAbstractSpinBox, QComboBox)):
+                return
+            def input_fill(widget):
+                readonly = isinstance(widget, QLineEdit) and widget.isReadOnly()
+                return "#f7f8fa" if readonly or not widget.isEnabled() else CARD
+            def input_edge(widget):
+                focused = QApplication.focusWidget()
+                focus = widget.hasFocus() or (focused is not None and widget.isAncestorOf(focused))
+                return PRIMARY if focus else ("#c6cdd9" if widget.underMouse() else BORDER_STRONG)
+            apply_surface(w, input_fill, input_edge, RADIUS)
+        elif isinstance(w, QToolButton) and isinstance(w.parentWidget(), QToolBar):
+            apply_surface(w, "transparent", "transparent", RADIUS,
+                          states={"hover": dict(fill=PRIMARY_SOFT),
+                                  "pressed": dict(fill="#dbe7fa")})
+        elif isinstance(w, QGroupBox):
+            # Layout variants with stripped groups provide their own surface.
+            if "background:transparent" in w.styleSheet().replace(" ", ""):
+                return
+            apply_surface(w, CARD, BORDER, PANEL_RADIUS,
+                          rect=lambda widget: QRectF(widget.rect()).adjusted(0, 32, 0, 0))
+        elif isinstance(w, QListWidget):
+            apply_surface(w, CARD, BORDER, PANEL_RADIUS)
+            _local_override(w, "QListWidget::item:hover,QListWidget::item:selected"
+                               "{background:transparent;}"
+                               "QListWidget{selection-background-color:transparent;}")
+            w.setItemDelegate(_ContinuousItems(w))
+            w.viewport().setAutoFillBackground(False)
+            w.setMouseTracking(True)
+        elif isinstance(w, QCheckBox):
+            _local_override(w, "QCheckBox::indicator,QCheckBox::indicator:hover,"
+                               "QCheckBox::indicator:checked"
+                               "{background:transparent;border-color:transparent;}")
+            w._continuous_native_kind = "checkbox"
+        elif isinstance(w, QSlider):
+            w._continuous_native_kind = "slider"
+        elif isinstance(w, QScrollBar):
+            w._continuous_native_kind = "scrollbar"
+        elif isinstance(w, QProgressBar):
+            w._continuous_native_kind = "progress"
+        elif isinstance(w, QSplitterHandle):
+            apply_surface(w, "transparent", None, 5, border_width=0,
+                          states={"hover": dict(fill="#e3e6ec")})
+        elif isinstance(w, QMenu):
+            w.setAttribute(Qt.WA_TranslucentBackground, True)
+            surface = apply_surface(w, CARD, BORDER, RADIUS)
+            _local_override(w, "QMenu::item:selected{background:transparent;}")
+            surface.overlay = self._paint_selection
+        elif isinstance(w, QMenuBar):
+            clear = "background:transparent" in w.styleSheet().replace(" ", "")
+            surface = apply_surface(w, "transparent" if clear else CARD, None, 0,
+                                    border_width=0, edges={} if clear else {"bottom": BORDER})
+            _local_override(w, "QMenuBar::item:selected{background:transparent;}")
+            surface.overlay = self._paint_selection
+        elif isinstance(w, (QLabel, QFrame)) and w.metaObject().className() != "QTipLabel":
+            if "paintEvent" in type(w).__dict__ and type(w).__module__.startswith("app."):
+                return
+            if apply_declared_surface(w) is None:
+                return
+            if hasattr(w, "viewport"):
+                w.viewport().setAutoFillBackground(False)
+        elif w.metaObject().className() == "QTipLabel":
+            w.setAttribute(Qt.WA_TranslucentBackground, True)
+            apply_surface(w, QColor(43, 50, 66, 240), None, RADIUS, border_width=0)
+        else:
+            return
+        w._continuous_configured = True
+
+    def _configure_pending(self):
+        pending = tuple(self._style_pending)
+        self._style_pending.clear()
+        for widget in pending:
+            if isValid(widget):
+                self.configure(widget)
+
+    def eventFilter(self, w, event):  # noqa: N802
+        kind = event.type()
+        if kind in (QEvent.Polish, QEvent.Show):
+            self.configure(w)
+        elif kind == QEvent.StyleChange and isinstance(w, QWidget):
+            # StyleChange is also delivered during native widget construction
+            # and repolish. Never mutate QSS or inspect virtual widget state on
+            # that stack; weak references keep deletion before dispatch safe.
+            self._style_pending.add(w)
+            self._style_timer.start(0)
+        if kind == QEvent.Paint and isinstance(w, QWidget):
+            native = getattr(w, "_continuous_native_kind", None)
+            if native:
+                return self._paint(w, native)
+        return False
+
+    @staticmethod
+    def _paint_selection(painter, widget):
+        action = widget.activeAction()
+        if action is not None and not action.isSeparator():
+            draw_surface(painter, QRectF(widget.actionGeometry(action)), PRIMARY_SOFT, None, 6, 0)
+
+    def _paint(self, w, kind):
+        p = QPainter(w)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        if kind == "checkbox":
+            opt = QStyleOptionButton()
+            w.initStyleOption(opt)
+            rect = w.style().subElementRect(QStyle.SE_CheckBoxIndicator, opt, w)
+            checked = w.isChecked()
+            draw_surface(p, QRectF(rect), PRIMARY if checked else CARD,
+                         PRIMARY if checked or w.underMouse() else "#c3c9d4", 4)
+            # app.widgets.CheckBox draws its own check over the native label.
+            if checked and w.metaObject().className() != "CheckBox":
+                p.setPen(QPen(QColor("white"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                from PySide6.QtGui import QPainterPath
+                tick = QPainterPath()
+                tick.moveTo(rect.x() + rect.width() * .26, rect.y() + rect.height() * .52)
+                tick.lineTo(rect.x() + rect.width() * .45, rect.y() + rect.height() * .72)
+                tick.lineTo(rect.x() + rect.width() * .76, rect.y() + rect.height() * .31)
+                p.drawPath(tick)
+        elif kind in ("slider", "scrollbar"):
+            opt = QStyleOptionSlider()
+            w.initStyleOption(opt)
+            if kind == "scrollbar":
+                rect = w.style().subControlRect(QStyle.CC_ScrollBar, opt,
+                                               QStyle.SC_ScrollBarSlider, w)
+                hovered = bool(opt.activeSubControls & QStyle.SC_ScrollBarSlider)
+                draw_surface(p, QRectF(rect), "#b9c0cc" if hovered else "#d3d7de",
+                             None, 4, 0, capsule=True)
+            else:
+                groove = w.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, w)
+                handle = w.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, w)
+                draw_surface(p, QRectF(groove), "#e3e6ec", None, 2, 0, capsule=True)
+                p.save()
+                p.setClipPath(capsule_path(QRectF(groove)))
+                filled = QRectF(groove)
+                if w.orientation() == Qt.Horizontal:
+                    if opt.upsideDown:
+                        filled.setLeft(handle.center().x())
+                    else:
+                        filled.setRight(handle.center().x())
+                elif opt.upsideDown:
+                    filled.setTop(handle.center().y())
+                else:
+                    filled.setBottom(handle.center().y())
+                p.fillRect(filled, QColor(PRIMARY))
+                p.restore()
+                if not w.isEnabled():
+                    fill, edge = "#f2f3f6", "#c9ced8"
+                else:
+                    hovered = bool(opt.activeSubControls & QStyle.SC_SliderHandle)
+                    fill = PRIMARY if w.isSliderDown() else (PRIMARY_SOFT if hovered else CARD)
+                    edge = PRIMARY
+                # Slider thumb is an intentional circular control.
+                p.setPen(QPen(QColor(edge), 2))
+                p.setBrush(QColor(fill))
+                p.drawEllipse(QRectF(handle).adjusted(1, 1, -1, -1))
+        elif kind == "progress":
+            opt = QStyleOptionProgressBar()
+            w.initStyleOption(opt)
+            rect = QRectF(w.rect())
+            draw_surface(p, rect, "#e9ecf1", None, 0, 0, capsule=True)
+            p.save()
+            p.setClipPath(capsule_path(rect))
+            fill = QRectF(rect)
+            busy = w.minimum() == w.maximum() == 0
+            if busy:
+                if w.isVisible() and w.isEnabled():
+                    self._busy.add(w)
+                    if not self._timer.isActive():
+                        self._last_tick = time.perf_counter()
+                        self._timer.start()
+                offset, span = busy_band(self._phase)
+                if w.orientation() == Qt.Horizontal:
+                    fill.setWidth(rect.width() * span)
+                    fill.moveLeft(rect.left() + rect.width() * offset)
+                    if w.invertedAppearance() != (w.layoutDirection() == Qt.RightToLeft):
+                        fill.moveRight(rect.right() - rect.width() * offset)
+                else:
+                    fill.setHeight(rect.height() * span)
+                    fill.moveTop(rect.top() + rect.height() * offset)
+                    if not w.invertedAppearance():
+                        fill.moveBottom(rect.bottom() - rect.height() * offset)
+            else:
+                self._busy.discard(w)
+                fraction = max(0.0, min(1.0, (w.value() - w.minimum()) /
+                                       max(1, w.maximum() - w.minimum())))
+                if w.orientation() == Qt.Horizontal:
+                    fill.setWidth(rect.width() * fraction)
+                    if w.invertedAppearance() != (w.layoutDirection() == Qt.RightToLeft):
+                        fill.moveRight(rect.right())
+                else:
+                    fill.setHeight(rect.height() * fraction)
+                    if not w.invertedAppearance():
+                        fill.moveBottom(rect.bottom())
+            draw_surface(p, fill, PRIMARY, None, 0, 0, capsule=True)
+            p.restore()
+            if w.isTextVisible():
+                p.setPen(w.palette().color(QPalette.Text))
+                p.drawText(w.rect(), w.alignment(), w.text())
+        p.end()
+        return kind in ("slider", "scrollbar", "progress")
+
+
+def install_continuous_style(app: QApplication | None = None):
+    """Install continuous backgrounds once; preserve all existing QSS metrics.
+
+    Covers standard buttons, inputs, groups, lists, checkbox indicators, menu
+    selections, tooltips, sliders, scrollbars and progress bars. Explicit
+    ``corners.apply_surface`` calls take precedence. Set a custom painter's
+    ``continuousCorners`` property to False before polish to opt out.
+    """
+    app = app or QApplication.instance()
+    if app is None:
+        return None
+    current = getattr(app, "_continuous_style", None)
+    if current is None:
+        current = _ContinuousStyle(app)
+        app._continuous_style = current
+    return current

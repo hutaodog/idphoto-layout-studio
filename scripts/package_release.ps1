@@ -177,11 +177,19 @@ $odRoot = Join-Path $root 'dist_onedir'
 $od = Get-ChildItem $odRoot -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($DocsOnly -and -not $od) { Write-Host '!! -DocsOnly needs an existing dist_onedir build'; exit 1 }
 if ($od) {
-  $docList = @($docUsage, 'README.md', $docPlan, 'docs\vendor-patches.md')
+  # Public documentation only. Keep relative paths so Markdown links still work.
+  Remove-Item -LiteralPath (Join-Path $od.FullName $docPlan) -Force -ErrorAction SilentlyContinue
+  $docList = @($docUsage, 'README.md', 'CHANGELOG.md', 'NOTICE.md', 'LICENSE',
+               'docs\vendor-patches.md', 'docs\research\photo-size-sources.md',
+               'docs\validation-v1.6.7.md', 'docs\validation-v1.6.12.md', 'screenshots\v1.6.7-layout.png',
+               'screenshots\v1.6.7-original.png', 'screenshots\v1.6.12-options.png',
+                'screenshots\v1.6.12-motion.gif')
   foreach ($doc in $docList) {
     $src = Join-Path $root $doc
     if (Test-Path -LiteralPath $src) {
-      Copy-Item -LiteralPath $src -Destination (Join-Path $od.FullName (Split-Path $doc -Leaf)) -Force
+      $dest = Join-Path $od.FullName $doc
+      New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
+      Copy-Item -LiteralPath $src -Destination $dest -Force
       Write-Host ("   + {0}" -f (Split-Path $doc -Leaf))
     } else {
       Write-Host ("   !! missing doc: {0}" -f $doc)

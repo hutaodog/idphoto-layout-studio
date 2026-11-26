@@ -89,9 +89,9 @@ def test_merged_names_are_still_searchable(lib):
         "电子驾照": "小一寸",
         "小二寸": "大一寸",
         "护照": "大一寸",
-        "大二寸": "二寸",
+        "大二寸": "二寸（35×53mm）",
         "简历照": "一寸",
-        "35x49": "简历照（宽版）",
+        "35x49": "二寸（35×49mm）",
     }
     for kw, want in cases.items():
         hits = [s.name_zh for s in lib.search(kw)]
@@ -151,3 +151,40 @@ def test_papers_are_consistent(lib):
 def test_unknown_spec_raises(lib):
     with pytest.raises(KeyError):
         lib.photo("no_such_spec")
+
+
+def test_named_inch_presets_keep_distinct_business_evidence(lib):
+    expected = {"cn_yicun": ((25, 35), (295, 413)),
+                "cn_ercun": ((35, 53), (413, 626)),
+                "cn_resume_wide": ((35, 49), (413, 579)),
+                "cn_sancun": ((55, 84), (650, 992))}
+    for id, (mm, px) in expected.items():
+        spec = lib.photo(id)
+        assert spec.mm == mm and spec.px == px
+        assert spec.refs
+        assert all(ref["scope"] and ref["issuer"] and ref["verified"] for ref in spec.refs)
+    assert lib.photo("cn_sancun").confidence == "D"
+    assert "商业" in lib.photo("cn_sancun").note
+    assert lib.photo("cn_resume_wide").id in {s.id for s in lib.search("简历照（宽版）")}
+
+
+def test_ncre_orientation_minimum_and_current_source_conflict(lib):
+    spec = lib.photo("exam_ncre")
+    assert spec.px == (144, 192) and spec.hw == (192, 144)
+    assert spec.mm == (12.19, 16.26) and spec.mm_from_px
+    assert spec.kb_limits == (20, 200)
+    assert "2022" in spec.name_zh and "冲突" in spec.note
+    assert any("2026" in r["scope"] and "冲突" in r["scope"] for r in spec.refs)
+
+
+@pytest.mark.parametrize("changes", [
+    {"mm": (0, 35)}, {"mm": (float("nan"), 35)}, {"dpi": 0},
+    {"px": (295, -1)}, {"px": (100, 100)}, {"confidence": "Z"},
+    {"bg": ("missing-color",)},
+])
+def test_require_rejects_corrupt_photo_geometry_or_references(lib, changes):
+    from dataclasses import replace
+    bad = replace(lib.photo("cn_yicun"), **changes)
+    isolated = SpecLibrary([bad], lib.papers, lib.colors)
+    with pytest.raises(ValueError):
+        isolated.require()
